@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import html
 import json
 import time
 import base64
@@ -33,7 +34,7 @@ EBAY_XML_URL = "https://api.ebay.com/ws/api.dll"
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 
 # ==============================================================================
-# MÓDULO 0: AUTO-RENOVACIÓN DEL TOKEN DE EBAY Y UTILIDADES BASE
+# MÓDULO 0: AUTO-DETECCIÓN DE CREDENCIALES, MODELOS IA Y SERVICIOS DE EBAY
 # ==============================================================================
 def verificar_formato_secretos():
     print(f"🔎 [Diagnóstico] EBAY_APP_ID len={len(EBAY_APP_ID)} | inicio={EBAY_APP_ID[:12]}...")
@@ -70,6 +71,39 @@ def obtener_token_ebay_vivo():
 
 EBAY_ACTIVE_TOKEN = obtener_token_ebay_vivo()
 
+def obtener_modelo_groq_activo():
+    if not GROQ_API_KEY:
+        return "openai/gpt-oss-120b"
+    try:
+        res = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=15
+        ).json()
+        disponibles = [
+            m["id"] for m in res.get("data", [])
+            if not any(x in m["id"].lower() for x in ["whisper", "guard", "tts", "orpheus", "playai"])
+        ]
+        preferidos = [
+            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
+            "qwen/qwen3-32b",
+            "openai/gpt-oss-20b",
+            "llama-3.1-8b-instant"
+        ]
+        for p in preferidos:
+            if p in disponibles:
+                print(f"🧠 [Groq IA] Modelo activo seleccionado: {p}")
+                return p
+        if disponibles:
+            print(f"🧠 [Groq IA] Modelo activo seleccionado: {disponibles[0]}")
+            return disponibles[0]
+    except Exception as e:
+        print(f"⚠️ Aviso detectando modelos Groq: {e}")
+    return "openai/gpt-oss-120b"
+
+GROQ_MODEL_ACTIVO = obtener_modelo_groq_activo()
+
 def obtener_access_token_cj():
     url = "https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken"
     res = requests.post(url, json={"apiKey": CJ_TOKEN}, timeout=15).json()
@@ -88,24 +122,17 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
+    instruccion_extra = "\nResponde ÚNICAMENTE con un objeto JSON válido, sin texto adicional ni bloques markdown." if json_mode else ""
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": GROQ_MODEL_ACTIVO,
         "temperature": 0.2,
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + instruccion_extra},
             {"role": "user", "content": user_prompt}
         ]
     }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
 
-    res = requests.post(url, headers=headers, json=payload, timeout=30).json()
-
-    # Reintento automático sin restricción estricta de JSON si Groq devuelve error de formato
-    if "choices" not in res and json_mode:
-        payload.pop("response_format", None)
-        res = requests.post(url, headers=headers, json=payload, timeout=30).json()
-
+    res = requests.post(url, headers=headers, json=payload, timeout=35).json()
     if "choices" not in res:
         print(f"⚠️ Respuesta inesperada de Groq: {res}")
         return {} if json_mode else ""
@@ -113,11 +140,19 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
     contenido = res["choices"][0]["message"]["content"].strip()
     if not json_mode:
         return contenido
+
+    contenido_limpio = re.sub(r"^```(?:json)?|```$", "", contenido, flags=re.MULTILINE).strip()
     try:
-        return json.loads(contenido)
+        return json.loads(contenido_limpio)
     except Exception:
-        match = re.search(r"\{.*\}", contenido, re.DOTALL)
-        return json.loads(match.group(0)) if match else {}
+        match = re.search(r"\{.*\}", contenido_limpio, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+        print(f"⚠️ No se pudo parsear JSON de Groq, usando respaldo automático.")
+        return {}
 
 def limpiar_xml(texto):
     return (
@@ -237,7 +272,7 @@ def agente_1_cazar_tendencia(skus_excluidos):
     contexto_tendencias = titulos_amz if titulos_amz else ["LED ambient lamps", "kitchen organizers", "portable massagers", "smart home gadgets"]
 
     kw_json = llamar_groq(
-        "Eres un analista de producto de dropshipping europeo. Devuelve únicamente un objeto JSON válido.",
+        "Eres un analista de producto de dropshipping europeo.",
         f"Tendencias detectadas hoy: {contexto_tendencias}. Devuelve un JSON con una lista 'keywords' de 5 palabras clave cortas en inglés (1 o 2 palabras cada una) de productos genéricos de alta demanda para buscar en almacén europeo. Ejemplo: {{\"keywords\": [\"lamp\", \"projector\", \"massager\", \"kitchen\", \"led\"]}}"
     )
 
@@ -315,7 +350,7 @@ def agente_1_cazar_tendencia(skus_excluidos):
 def agente_2_diseno_multimedia(producto):
     print("🎨 [Agente 2 - Diseño] Creando 10 anuncios + Vídeo Vertical MP4 + Lote CSV para Canva Pro...")
     disenos = llamar_groq(
-        "Eres un director creativo de e-commerce en Europa. Responde solo con un objeto JSON válido.",
+        "Eres un director creativo de e-commerce en Europa.",
         f"Producto: {producto['titulo_en']}. Precio: {producto['precio_venta']}€. Genera un JSON con una lista 'variantes' de exactamente 10 versiones de anuncio. Cada ítem debe tener: 'id' (1 a 10), 'gancho' (máx 4 palabras impactantes en español), 'angulo' (frase persuasiva para TikTok/Pinterest) y 'color_hex' (color oscuro elegante ej: #0F172A, #1E3A8A, #065F46, #7C2D12)."
     )
 
@@ -360,7 +395,7 @@ def agente_2_diseno_multimedia(producto):
                     frames_video.append(arr_frame)
 
         if frames_video:
-            imageio.mimsave("anuncios_generados/reel_tiktok_viral.mp4", frames_video, fps=15)
+            imageio.mimsave("anuncios_generados/reel_tiktok_viral.mp4", frames_video, fps=15, macro_block_size=8)
             print("🎬 [Agente 2] Vídeo vertical MP4 generado con éxito.")
     except Exception as e:
         print(f"Aviso en renderizado multimedia: {e}")
@@ -378,6 +413,54 @@ def detectar_categoria_ebay_es(query_es):
     res = ebay_xml_call("GetSuggestedCategories", xml)
     match = re.search(r"<CategoryID>(\d+)</CategoryID>", res)
     return match.group(1) if match else "172008"
+
+def obtener_servicios_envio_ebay_es():
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+    <GeteBayDetailsRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+      <DetailName>ShippingServiceDetails</DetailName>
+    </GeteBayDetailsRequest>"""
+    res_xml = ebay_xml_call("GeteBayDetails", xml)
+    nacionales = []
+    internacionales = []
+    try:
+        root = ET.fromstring(res_xml)
+        ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
+        for sd in root.findall(".//eb:ShippingServiceDetails", ns):
+            valid = sd.find("eb:ValidForSellingFlow", ns)
+            if valid is None or valid.text != "true":
+                continue
+            code_el = sd.find("eb:ShippingService", ns)
+            if code_el is None or not code_el.text:
+                continue
+            code = code_el.text
+            intl = sd.find("eb:InternationalService", ns)
+            if intl is not None and intl.text == "true":
+                internacionales.append(code)
+            else:
+                nacionales.append(code)
+    except Exception as e:
+        print(f"Aviso leyendo servicios de envío eBay: {e}")
+
+    nac_elegido = "ES_CartasCertificadas"
+    for cand in ["ES_EstandarDesdeElExtranjero", "ES_CartasCertificadas", "ES_PaqueteAzul", "ES_EnvioUrgente"]:
+        if cand in nacionales:
+            nac_elegido = cand
+            break
+    else:
+        if nacionales:
+            nac_elegido = nacionales[0]
+
+    intl_elegido = "ES_StandardInternational"
+    for cand in ["ES_StandardInternational", "ES_EconomyInternational", "ES_TrackedInternational"]:
+        if cand in internacionales:
+            intl_elegido = cand
+            break
+    else:
+        if internacionales:
+            intl_elegido = internacionales[0]
+
+    print(f"🚚 [Agente 3] Servicios de envío verificados en eBay ES: Nacional={nac_elegido} | UE={intl_elegido}")
+    return nac_elegido, intl_elegido
 
 def normalizar_seo_listing(seo_raw, producto, texto_limpio):
     if not isinstance(seo_raw, dict):
@@ -425,49 +508,37 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         "specifics": specifics
     }
 
-def agente_3_publicar_tienda_europa(producto, variantes):
-    print("🛒 [Agente 3 - Tienda UE] Publicando en eBay con alcance a toda la Unión Europea...")
-    texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:900]
-
-    seo_raw = llamar_groq(
-        "Eres un experto en SEO para eBay Europa. Devuelve únicamente JSON válido sin comillas sin escapar dentro de los valores.",
-        f"""Traduce y optimiza este producto para eBay España.
-Producto: {producto['titulo_en']}
-Detalles: {texto_limpio}
-
-Devuelve este JSON exacto:
-{{
-  "query_categoria": "2 palabras en español del objeto",
-  "titulo": "Título SEO en español de 65 a 78 caracteres",
-  "descripcion_html": "<div><h2>Calidad Premium - Envío Rápido Europa</h2><p>Descripción comercial en español.</p><ul><li>Envío rápido desde almacén europeo en 3-7 días.</li><li>Garantía europea de 14 días.</li></ul></div>",
-  "specifics": {{
-    "Marca": "Genérico",
-    "Tipo": "Accesorio",
-    "Color": "Multicolor",
-    "Material": "Alta resistencia"
-  }}
-}}"""
-    )
-
-    seo = normalizar_seo_listing(seo_raw, producto, texto_limpio)
-    print(f"📝 [Agente 3] Título SEO generado: {seo['titulo']}")
-
-    cat_id = detectar_categoria_ebay_es(seo["query_categoria"])
-    fotos_xml = "".join([f"<PictureURL>{url}</PictureURL>" for url in producto["fotos"]])
+def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, incluir_politicas=True, nac_srv="ES_CartasCertificadas", intl_srv="ES_StandardInternational"):
     titulo_xml = limpiar_xml(seo["titulo"])
-
-    specifics_xml = ""
-    for k, v in seo["specifics"].items():
-        k_limpio = limpiar_xml(k)
-        val_limpio = limpiar_xml(v)
-        if k_limpio and val_limpio:
-            specifics_xml += f"<NameValueList><Name>{k_limpio}</Name><Value>{val_limpio}</Value></NameValueList>"
-    specifics_xml += "<NameValueList><Name>MPN</Name><Value>No aplicable</Value></NameValueList>"
-    specifics_xml += "<NameValueList><Name>EAN</Name><Value>No aplicable</Value></NameValueList>"
-
     pais_almacen = producto.get("almacen", "DE")
 
-    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+    bloque_politicas = ""
+    if incluir_politicas:
+        bloque_politicas = f"""
+        <ReturnPolicy>
+          <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
+          <ReturnsWithinOption>Days_14</ReturnsWithinOption>
+          <ShippingCostPaidByOption>Buyer</ShippingCostPaidByOption>
+        </ReturnPolicy>
+        <ShippingDetails>
+          <ShippingType>Flat</ShippingType>
+          <ShippingServiceOptions>
+            <ShippingServicePriority>1</ShippingServicePriority>
+            <ShippingService>{nac_srv}</ShippingService>
+            <ShippingServiceCost currencyID="EUR">0.00</ShippingServiceCost>
+            <ShippingServiceAdditionalCost currencyID="EUR">0.00</ShippingServiceAdditionalCost>
+            <FreeShipping>true</FreeShipping>
+          </ShippingServiceOptions>
+          <InternationalShippingServiceOption>
+            <ShippingServicePriority>1</ShippingServicePriority>
+            <ShippingService>{intl_srv}</ShippingService>
+            <ShippingServiceCost currencyID="EUR">0.00</ShippingServiceCost>
+            <ShippingServiceAdditionalCost currencyID="EUR">0.00</ShippingServiceAdditionalCost>
+            <ShipToLocation>EuropeanUnion</ShipToLocation>
+          </InternationalShippingServiceOption>
+        </ShippingDetails>"""
+
+    return f"""<?xml version="1.0" encoding="utf-8"?>
     <AddFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
       <Item>
         <SKU>{producto['sku']}</SKU>
@@ -492,39 +563,73 @@ Devuelve este JSON exacto:
             <MPN>No aplicable</MPN>
           </BrandMPN>
         </ProductListingDetails>
-        <ReturnPolicy>
-          <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
-          <ReturnsWithinOption>Days_14</ReturnsWithinOption>
-          <ShippingCostPaidByOption>Buyer</ShippingCostPaidByOption>
-        </ReturnPolicy>
-        <ShippingDetails>
-          <ShippingServiceOptions>
-            <ShippingServicePriority>1</ShippingServicePriority>
-            <ShippingService>ES_OtrosEnvios</ShippingService>
-            <FreeShipping>true</FreeShipping>
-          </ShippingServiceOptions>
-          <InternationalShippingServiceOption>
-            <ShippingServicePriority>1</ShippingServicePriority>
-            <ShippingService>ES_StandardInternational</ShippingService>
-            <ShippingServiceCost currencyID="EUR">0.00</ShippingServiceCost>
-            <ShippingServiceAdditionalCost currencyID="EUR">0.00</ShippingServiceAdditionalCost>
-            <ShipToLocation>EuropeanUnion</ShipToLocation>
-          </InternationalShippingServiceOption>
-        </ShippingDetails>
+        {bloque_politicas}
         <Site>Spain</Site>
       </Item>
     </AddFixedPriceItemRequest>"""
 
+def agente_3_publicar_tienda_europa(producto, variantes):
+    print("🛒 [Agente 3 - Tienda UE] Publicando en eBay con alcance a toda la Unión Europea...")
+    texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:900]
+
+    seo_raw = llamar_groq(
+        "Eres un experto en SEO para eBay Europa. Devuelve únicamente JSON válido.",
+        f"""Traduce y optimiza este producto para eBay España.
+Producto: {producto['titulo_en']}
+Detalles: {texto_limpio}
+
+Devuelve este JSON exacto:
+{{
+  "query_categoria": "2 palabras en español del objeto",
+  "titulo": "Título SEO en español de 65 a 78 caracteres",
+  "descripcion_html": "<div><h2>Calidad Premium - Envío Rápido Europa</h2><p>Descripción comercial en español.</p><ul><li>Envío rápido desde almacén europeo en 3-7 días.</li><li>Garantía europea de 14 días.</li></ul></div>",
+  "specifics": {{
+    "Marca": "Genérico",
+    "Tipo": "Accesorio",
+    "Color": "Multicolor",
+    "Material": "Alta resistencia"
+  }}
+}}"""
+    )
+
+    seo = normalizar_seo_listing(seo_raw, producto, texto_limpio)
+    print(f"📝 [Agente 3] Título SEO generado: {seo['titulo']}")
+
+    cat_id = detectar_categoria_ebay_es(seo["query_categoria"])
+    fotos_xml = "".join([f"<PictureURL>{url}</PictureURL>" for url in producto["fotos"]])
+
+    specifics_xml = ""
+    for k, v in seo["specifics"].items():
+        k_limpio = limpiar_xml(k)
+        val_limpio = limpiar_xml(v)
+        if k_limpio and val_limpio:
+            specifics_xml += f"<NameValueList><Name>{k_limpio}</Name><Value>{val_limpio}</Value></NameValueList>"
+    specifics_xml += "<NameValueList><Name>MPN</Name><Value>No aplicable</Value></NameValueList>"
+    specifics_xml += "<NameValueList><Name>EAN</Name><Value>No aplicable</Value></NameValueList>"
+
+    nac_srv, intl_srv = obtener_servicios_envio_ebay_es()
+    xml = construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, True, nac_srv, intl_srv)
     res = ebay_xml_call("AddFixedPriceItem", xml)
+
     match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
     if match_id:
         print(f"🎉 [Agente 3] ¡PUBLICADO EN EBAY! ItemID: {match_id.group(1)}")
         return seo, match_id.group(1), cat_id, None
-    else:
-        errores = re.findall(r"<LongMessage>(.*?)</LongMessage>", res)
-        err_msg = " | ".join(errores) if errores else res[:500]
-        print(f"⚠️ eBay devolvió aviso/error: {err_msg}")
-        return seo, "ERROR_EBAY", cat_id, err_msg
+
+    # Si eBay tiene perfiles comerciales activos en la cuenta, reintenta usando los perfiles por defecto
+    if "SellerProfiles" in res or "Business Policies" in res or "perfiles" in res.lower():
+        print("🔄 [Agente 3] Detectados Perfiles Comerciales en eBay, aplicando políticas de la cuenta...")
+        xml_perfiles = construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, False)
+        res = ebay_xml_call("AddFixedPriceItem", xml_perfiles)
+        match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
+        if match_id:
+            print(f"🎉 [Agente 3] ¡PUBLICADO EN EBAY! ItemID: {match_id.group(1)}")
+            return seo, match_id.group(1), cat_id, None
+
+    errores = [html.unescape(e) for e in re.findall(r"<LongMessage>(.*?)</LongMessage>", res)]
+    err_msg = " | ".join(errores) if errores else html.unescape(res[:500])
+    print(f"⚠️ eBay devolvió aviso/error: {err_msg}")
+    return seo, "ERROR_EBAY", cat_id, err_msg
 
 # ==============================================================================
 # AGENTE 7 (PROMOCIÓN GRATIS MULTI-SITIO): Autopublica en Pinterest + Redes
