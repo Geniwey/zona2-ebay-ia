@@ -33,9 +33,22 @@ PINTEREST_BOARD_ID = os.environ.get("PINTEREST_BOARD_ID", "").strip()
 EBAY_XML_URL = "https://api.ebay.com/ws/api.dll"
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 
+# Palabras bloqueadas por seguridad UE / políticas de cuentas nuevas en eBay
+PALABRAS_PROHIBIDAS_UE = {
+    "magnet", "magnetic", "toy", "toys", "children", "child", "kids", "baby", "infant",
+    "battery", "batteries", "lithium", "powerbank", "charger", "knife", "knives", "blade",
+    "laser", "medical", "therapy", "massage", "massager", "supplement", "vitamin", "cream",
+    "serum", "cosmetic", "perfume", "liquid", "oil", "cbd", "vape", "smoke", "weapon",
+    "lego", "disney", "marvel", "pokemon", "apple", "iphone", "samsung", "sony", "nike",
+    "adidas", "gucci", "rolex", "dyson", "philips", "xiaomi", "bluetooth", "wifi"
+}
+
 # ==============================================================================
 # MÓDULO 0: AUTO-DETECCIÓN DE CREDENCIALES, MODELOS IA Y UTILIDADES
 # ==============================================================================
+def es_token_auth_n_auth(token):
+    return token.startswith("AgAAAA") or ("#r^1#" in token and len(token) < 600)
+
 def verificar_formato_secretos():
     print(f"🔎 [Diagnóstico] EBAY_APP_ID len={len(EBAY_APP_ID)} | inicio={EBAY_APP_ID[:12]}...")
     print(f"🔎 [Diagnóstico] EBAY_CERT_ID len={len(EBAY_CERT_ID)} | inicio={EBAY_CERT_ID[:8]}...fin={EBAY_CERT_ID[-4:]}")
@@ -45,6 +58,10 @@ def obtener_token_ebay_vivo():
     verificar_formato_secretos()
     if not EBAY_REFRESH_TOKEN:
         return EBAY_STATIC_TOKEN
+
+    if es_token_auth_n_auth(EBAY_REFRESH_TOKEN):
+        print("🔑 [Seguridad] Detectado Token permanente Auth'n'Auth de eBay (válido hasta 2028).")
+        return EBAY_REFRESH_TOKEN
 
     if "#f^0#r^0#" in EBAY_REFRESH_TOKEN or len(EBAY_REFRESH_TOKEN) > 2200:
         print("🔑 [Seguridad] Detectado User Access Token directo de eBay. Conectando...")
@@ -193,9 +210,18 @@ def ebay_xml_call(call_name, xml_body):
         "X-EBAY-API-SITEID": "186",
         "X-EBAY-API-CALL-NAME": call_name,
         "X-EBAY-API-COMPATIBILITY-LEVEL": "1149",
-        "Content-Type": "text/xml; charset=utf-8",
-        "X-EBAY-API-IAF-TOKEN": EBAY_ACTIVE_TOKEN
+        "Content-Type": "text/xml; charset=utf-8"
     }
+    if es_token_auth_n_auth(EBAY_ACTIVE_TOKEN):
+        cred_xml = f"<RequesterCredentials><eBayAuthToken>{EBAY_ACTIVE_TOKEN}</eBayAuthToken></RequesterCredentials>"
+        xml_body = xml_body.replace(
+            'xmlns="urn:ebay:apis:eBLBaseComponents">',
+            f'xmlns="urn:ebay:apis:eBLBaseComponents">{cred_xml}',
+            1
+        )
+    else:
+        headers["X-EBAY-API-IAF-TOKEN"] = EBAY_ACTIVE_TOKEN
+
     resp = requests.post(EBAY_XML_URL, headers=headers, data=xml_body.encode("utf-8"), timeout=30)
     resp.encoding = "utf-8"
     return resp.text
@@ -268,50 +294,24 @@ def agente_6_datos_podar_catalogo():
     return skus_activos, eliminados, ganadores
 
 # ==============================================================================
-# AGENTE 1 (TENDENCIAS): Escanea Amazon + CJ Almacenes Unión Europea (DE/FR/ES/PL)
+# AGENTE 1 (TENDENCIAS): Escanea CJ Almacenes UE con Filtro Seguro UE
 # ==============================================================================
-def agente_1_cazar_tendencia(skus_excluidos):
-    print("🔍 [Agente 1 - Tendencias] Rastreando productos disparados en Amazon y almacenes UE...")
-    headers_amz = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "es-ES,es;q=0.9"
-    }
-    titulos_amz = []
-    urls_movers = [
-        "https://www.amazon.es/gp/movers-and-shakers/kitchen",
-        "https://www.amazon.es/gp/movers-and-shakers/lighting",
-        "https://www.amazon.es/gp/movers-and-shakers/sports"
-    ]
+def es_producto_seguro_ue(titulo_en):
+    palabras = set(re.findall(r"[a-z]+", str(titulo_en).lower()))
+    return len(palabras.intersection(PALABRAS_PROHIBIDAS_UE)) == 0
 
-    for u in urls_movers:
-        try:
-            r = requests.get(u, headers=headers_amz, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for el in soup.select(".p13n-sc-truncate-desktop-type2, ._cDEzb_p13n-sc-css-line-clamp-3_g3dy1")[:8]:
-                titulos_amz.append(el.get_text(strip=True))
-        except Exception:
-            pass
-
-    contexto_tendencias = titulos_amz if titulos_amz else ["LED ambient lamps", "kitchen organizers", "portable massagers", "smart home gadgets"]
-
-    kw_json = llamar_groq(
-        "Eres un analista de producto de dropshipping europeo.",
-        f"Tendencias detectadas hoy: {contexto_tendencias}. Devuelve un JSON con una lista 'keywords' de 5 palabras clave cortas en inglés (1 o 2 palabras cada una) de productos genéricos de alta demanda para buscar en almacén europeo. Ejemplo: {{\"keywords\": [\"lamp\", \"projector\", \"massager\", \"kitchen\", \"led\"]}}"
-    )
-
+def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
+    print("🔍 [Agente 1 - Tendencias] Rastreando productos seguros en almacenes de la Unión Europea...")
     headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN}
-    lista_keywords = kw_json.get("keywords", ["lamp", "led", "kitchen"])[:4]
-    lista_keywords.append("")
-
+    lista_keywords = ["organizer", "lamp", "holder", "storage", "decor", "rack", "light"]
     almacenes_ue = ["DE", "FR", "ES", "PL"]
+    candidatos = []
+    vistos = set(skus_excluidos)
 
     for pais in almacenes_ue:
         for kw in lista_keywords:
             time.sleep(1.2)
-            url_cj = f"https://developers.cjdropshipping.com/api2.0/v1/product/list?countryCode={pais}&pageNum=1&pageSize=40"
-            if kw:
-                url_cj += f"&keyword={requests.utils.quote(kw)}"
-
+            url_cj = f"https://developers.cjdropshipping.com/api2.0/v1/product/list?countryCode={pais}&pageNum=1&pageSize=40&keyword={requests.utils.quote(kw)}"
             res_cj = requests.get(url_cj, headers=headers_cj, timeout=15).json()
             if not res_cj.get("result"):
                 print(f"⚠️ CJ ({pais} | '{kw}'): {res_cj.get('message')}")
@@ -320,11 +320,12 @@ def agente_1_cazar_tendencia(skus_excluidos):
                 continue
 
             productos_lista = (res_cj.get("data") or {}).get("list") or []
-            print(f"📦 CJ Almacén {pais} (kw='{kw or 'TODO'}'): {len(productos_lista)} productos encontrados.")
+            print(f"📦 CJ Almacén {pais} (kw='{kw}'): {len(productos_lista)} productos encontrados.")
 
             for prod in productos_lista:
                 pid = prod.get("pid")
-                if not pid or pid in skus_excluidos:
+                titulo_en = prod.get("productNameEn", "")
+                if not pid or pid in vistos or not es_producto_seguro_ue(titulo_en):
                     continue
 
                 precio_raw = str(prod.get("sellPrice", "0")).split("-")[0].strip()
@@ -333,8 +334,8 @@ def agente_1_cazar_tendencia(skus_excluidos):
                 except ValueError:
                     continue
 
-                if 2.5 <= coste_cj <= 22.0:
-                    precio_venta = round((coste_cj * 2.8) + 1.50, 2)
+                if 3.0 <= coste_cj <= 16.0:
+                    precio_venta = round((coste_cj * 2.6) + 1.50, 2)
                     comision_ebay = round(precio_venta * 0.135, 2)
                     beneficio_neto = round(precio_venta - comision_ebay - coste_cj, 2)
 
@@ -353,19 +354,24 @@ def agente_1_cazar_tendencia(skus_excluidos):
                     if not fotos_limpias:
                         continue
 
-                    print(f"✅ Candidato seleccionado en {pais}: {prod.get('productNameEn')} ({coste_cj}€ -> {precio_venta}€)")
-                    return {
+                    vistos.add(pid)
+                    print(f"✅ Candidato seguro en {pais}: {titulo_en} ({coste_cj}€ -> {precio_venta}€)")
+                    candidatos.append({
                         "sku": pid,
                         "almacen": pais,
-                        "titulo_en": prod.get("productNameEn", "Trending Gadget"),
-                        "descripcion_en": det_data.get("description") or prod.get("productNameEn", ""),
+                        "titulo_en": titulo_en,
+                        "descripcion_en": det_data.get("description") or titulo_en,
                         "fotos": fotos_limpias,
                         "coste_cj": coste_cj,
                         "precio_venta": precio_venta,
                         "beneficio_neto": beneficio_neto
-                    }
+                    })
+                    if len(candidatos) >= max_candidatos:
+                        return candidatos
 
-    raise Exception("No se encontraron candidatos nuevos hoy en los almacenes de la UE.")
+    if not candidatos:
+        raise Exception("No se encontraron candidatos nuevos seguros hoy en los almacenes de la UE.")
+    return candidatos
 
 # ==============================================================================
 # AGENTE 2 (DISEÑO): 10 Imágenes + Vídeo Vertical .MP4 (Reels/TikTok) + CSV Canva
@@ -433,9 +439,8 @@ def obtener_categorias_hoja_ebay_es(query_es, titulo_es=""):
     categorias_validas = []
     vistos = set()
 
-    # 1. Consulta oficial vía eBay REST Taxonomy API (devuelve solo categorías hoja garantizadas en España)
     token_tax = obtener_token_publico_ebay()
-    consultas = [query_es, titulo_es[:45], "juguete educativo", "lampara decoracion hogar"]
+    consultas = [query_es, titulo_es[:45], "organizador hogar", "lampara decoracion"]
 
     if token_tax:
         headers_tax = {
@@ -464,36 +469,10 @@ def obtener_categorias_hoja_ebay_es(query_es, titulo_es=""):
             except Exception as e:
                 print(f"⚠️ Aviso Taxonomy API: {e}")
 
-    # 2. Respaldo ligero vía Trading API (LevelLimit=4 evita descarga masiva)
-    if not categorias_validas:
-        xml = """<?xml version="1.0" encoding="utf-8"?>
-        <GetCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-          <CategorySiteID>186</CategorySiteID>
-          <DetailLevel>ReturnAll</DetailLevel>
-          <LevelLimit>4</LevelLimit>
-          <ViewAllNodes>true</ViewAllNodes>
-        </GetCategoriesRequest>"""
-        res = ebay_xml_call("GetCategories", xml)
-        try:
-            root = ET.fromstring(res)
-            ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
-            for cat in root.findall(".//eb:Category", ns):
-                leaf = cat.find("eb:LeafCategory", ns)
-                cid = cat.find("eb:CategoryID", ns)
-                cname = cat.find("eb:CategoryName", ns)
-                if leaf is not None and leaf.text == "true" and cid is not None and cid.text:
-                    if cid.text not in vistos:
-                        vistos.add(cid.text)
-                        categorias_validas.append((cid.text, cname.text if cname is not None else ""))
-                    if len(categorias_validas) >= 6:
-                        break
-        except Exception as e:
-            print(f"⚠️ Aviso respaldo GetCategories: {e}")
-
     if categorias_validas:
         resumen = ", ".join([f"{cid} ({cname})" for cid, cname in categorias_validas[:3]])
         print(f"✅ [Agente 3] Subcategorías hoja detectadas en eBay ES: {resumen}")
-    return categorias_validas
+    return categorias_validas or [("181076", "Otros Hogar"), ("20625", "Organizadores")]
 
 def obtener_politicas_vendedor_ebay():
     xml = """<?xml version="1.0" encoding="utf-8"?>
@@ -529,47 +508,6 @@ def obtener_politicas_vendedor_ebay():
 
     return perfiles
 
-def obtener_servicios_envio_ebay_es():
-    xml = """<?xml version="1.0" encoding="utf-8"?>
-    <GeteBayDetailsRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-      <DetailName>ShippingServiceDetails</DetailName>
-    </GeteBayDetailsRequest>"""
-    res_xml = ebay_xml_call("GeteBayDetails", xml)
-    nacionales = []
-    internacionales = []
-    try:
-        root = ET.fromstring(res_xml)
-        ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
-        for sd in root.findall(".//eb:ShippingServiceDetails", ns):
-            valid = sd.find("eb:ValidForSellingFlow", ns)
-            if valid is None or valid.text != "true":
-                continue
-            code_el = sd.find("eb:ShippingService", ns)
-            if code_el is None or not code_el.text:
-                continue
-            code = code_el.text
-            intl = sd.find("eb:InternationalService", ns)
-            if intl is not None and intl.text == "true":
-                internacionales.append(code)
-            else:
-                nacionales.append(code)
-    except Exception:
-        pass
-
-    nac_elegido = nacionales[0] if nacionales else "ES_CartasCertificadas"
-    for cand in ["ES_EstandarDesdeElExtranjero", "ES_CartasCertificadas", "ES_PaqueteAzul", "ES_EnvioUrgente"]:
-        if cand in nacionales:
-            nac_elegido = cand
-            break
-
-    intl_elegido = internacionales[0] if internacionales else "ES_StandardInternational"
-    for cand in ["ES_StandardInternational", "ES_EconomyInternational", "ES_TrackedInternational"]:
-        if cand in internacionales:
-            intl_elegido = cand
-            break
-
-    return nac_elegido, intl_elegido
-
 def normalizar_seo_listing(seo_raw, producto, texto_limpio):
     if not isinstance(seo_raw, dict):
         seo_raw = {}
@@ -579,34 +517,38 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         or seo_raw.get("title")
         or seo_raw.get("Title")
         or seo_raw.get("titulo_seo")
-        or f"{producto['titulo_en'][:60]} Envio Gratis UE"
+        or f"{producto['titulo_en'][:55]} Envio Gratis UE"
     ).strip()
 
-    if len(titulo) > 80:
-        titulo = titulo[:80].rsplit(" ", 1)[0]
+    for prohibida in ["gratis", "regalo", "oferta", "100%", "garantizado"]:
+        titulo = re.sub(rf"\b{prohibida}\b", "", titulo, flags=re.IGNORECASE).strip()
+    titulo = re.sub(r"\s+", " ", titulo)
+
+    if len(titulo) > 78:
+        titulo = titulo[:78].rsplit(" ", 1)[0]
 
     descripcion = (
         seo_raw.get("descripcion_html")
         or seo_raw.get("description_html")
         or seo_raw.get("descripcion")
         or seo_raw.get("description")
-        or f"<div><h2>Calidad Premium - Stock en Europa</h2><p>{texto_limpio[:600]}</p><ul><li>Envío rápido desde almacén europeo en 3-7 días laborables.</li><li>Garantía europea de devolución de 14 días.</li></ul></div>"
+        or f"<p><b>Calidad y Diseño Moderno - Envío desde Europa</b></p><p>{texto_limpio[:500]}</p><ul><li>Envío rápido desde almacén europeo en 3 a 7 días laborables.</li><li>Devolución aceptada en 14 días según normativa europea.</li></ul>"
     )
     descripcion = re.sub(r"https?://\S+|www\.\S+", "", str(descripcion))
 
     query_cat = (
         seo_raw.get("query_categoria")
         or seo_raw.get("category_query")
-        or "iluminacion hogar"
+        or "organizador hogar"
     )
 
     specifics = seo_raw.get("specifics")
     if not isinstance(specifics, dict) or not specifics:
         specifics = {
-            "Marca": "Genérico",
-            "Tipo": "Accesorio",
-            "Color": "Multicolor",
-            "Material": "Alta resistencia"
+            "Marca": "Sin marca",
+            "Tipo": "Accesorio de hogar",
+            "Color": "Neutro",
+            "Material": "Plástico ABS / Metal"
         }
 
     return {
@@ -616,7 +558,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         "specifics": specifics
     }
 
-def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles_vendedor=None, nac_srv="ES_CartasCertificadas", intl_srv="ES_StandardInternational"):
+def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles_vendedor):
     titulo_xml = limpiar_xml(seo["titulo"])
     pais_almacen = producto.get("almacen", "DE")
 
@@ -631,30 +573,6 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
             partes_perfil.append(f"<SellerPaymentProfile><PaymentProfileID>{perfiles_vendedor['payment']}</PaymentProfileID></SellerPaymentProfile>")
         if partes_perfil:
             bloque_politicas = f"<SellerProfiles>{''.join(partes_perfil)}</SellerProfiles>"
-    elif perfiles_vendedor is not None:
-        bloque_politicas = f"""
-        <ReturnPolicy>
-          <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
-          <ReturnsWithinOption>Days_14</ReturnsWithinOption>
-          <ShippingCostPaidByOption>Buyer</ShippingCostPaidByOption>
-        </ReturnPolicy>
-        <ShippingDetails>
-          <ShippingType>Flat</ShippingType>
-          <ShippingServiceOptions>
-            <ShippingServicePriority>1</ShippingServicePriority>
-            <ShippingService>{nac_srv}</ShippingService>
-            <ShippingServiceCost currencyID="EUR">0.00</ShippingServiceCost>
-            <ShippingServiceAdditionalCost currencyID="EUR">0.00</ShippingServiceAdditionalCost>
-            <FreeShipping>true</FreeShipping>
-          </ShippingServiceOptions>
-          <InternationalShippingServiceOption>
-            <ShippingServicePriority>1</ShippingServicePriority>
-            <ShippingService>{intl_srv}</ShippingService>
-            <ShippingServiceCost currencyID="EUR">0.00</ShippingServiceCost>
-            <ShippingServiceAdditionalCost currencyID="EUR">0.00</ShippingServiceAdditionalCost>
-            <ShipToLocation>EuropeanUnion</ShipToLocation>
-          </InternationalShippingServiceOption>
-        </ShippingDetails>"""
 
     return f"""<?xml version="1.0" encoding="utf-8"?>
     <AddFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
@@ -668,16 +586,16 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
         <Country>{pais_almacen}</Country>
         <Location>Unión Europea</Location>
         <Currency>EUR</Currency>
-        <DispatchTimeMax>1</DispatchTimeMax>
+        <DispatchTimeMax>2</DispatchTimeMax>
         <ListingDuration>GTC</ListingDuration>
         <ListingType>FixedPriceItem</ListingType>
-        <Quantity>10</Quantity>
+        <Quantity>2</Quantity>
         <PictureDetails>{fotos_xml}</PictureDetails>
         <ItemSpecifics>{specifics_xml}</ItemSpecifics>
         <ProductListingDetails>
           <EAN>No aplicable</EAN>
           <BrandMPN>
-            <Brand>Genérico</Brand>
+            <Brand>Sin marca</Brand>
             <MPN>No aplicable</MPN>
           </BrandMPN>
         </ProductListingDetails>
@@ -686,25 +604,25 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
       </Item>
     </AddFixedPriceItemRequest>"""
 
-def agente_3_publicar_tienda_europa(producto, variantes):
-    print("🛒 [Agente 3 - Tienda UE] Publicando en eBay con alcance a toda la Unión Europea...")
-    texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:900]
+def agente_3_publicar_tienda_europa(producto, perfiles):
+    print("🛒 [Agente 3 - Tienda UE] Preparando ficha limpia para eBay Europa...")
+    texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:800]
 
     seo_raw = llamar_groq(
-        "Eres un experto en SEO para eBay Europa. Devuelve únicamente JSON válido.",
-        f"""Traduce y optimiza este producto para eBay España.
+        "Eres un experto en SEO y cumplimiento de políticas para eBay España. Prohibido usar palabras promocionales como 'gratis', 'oferta', '100%', marcas registradas, URLs o reclamos médicos. Devuelve únicamente JSON válido.",
+        f"""Traduce y optimiza este producto para eBay España de forma sobria y descriptiva.
 Producto: {producto['titulo_en']}
 Detalles: {texto_limpio}
 
 Devuelve este JSON exacto:
 {{
   "query_categoria": "2 palabras en español del objeto",
-  "titulo": "Título SEO en español de 65 a 78 caracteres",
-  "descripcion_html": "<div><h2>Calidad Premium - Envío Rápido Europa</h2><p>Descripción comercial en español.</p><ul><li>Envío rápido desde almacén europeo en 3-7 días.</li><li>Garantía europea de 14 días.</li></ul></div>",
+  "titulo": "Título descriptivo en español de 55 a 75 caracteres sin palabras promocionales",
+  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara y objetiva del producto en español.</p><ul><li>Característica 1</li><li>Característica 2</li><li>Envío desde almacén europeo en 3 a 7 días laborables.</li></ul>",
   "specifics": {{
-    "Marca": "Genérico",
-    "Tipo": "Accesorio",
-    "Color": "Multicolor",
+    "Marca": "Sin marca",
+    "Tipo": "Accesorio de hogar",
+    "Color": "Neutro",
     "Material": "Alta resistencia"
   }}
 }}"""
@@ -714,10 +632,7 @@ Devuelve este JSON exacto:
     print(f"📝 [Agente 3] Título SEO generado: {seo['titulo']}")
 
     candidatos_cat = obtener_categorias_hoja_ebay_es(seo["query_categoria"], seo["titulo"])
-    if not candidatos_cat:
-        candidatos_cat = [("260324", "Construcción"), ("112581", "Iluminación")]
-
-    fotos_xml = "".join([f"<PictureURL>{url}</PictureURL>" for url in producto["fotos"]])
+    fotos_xml = "".join([f"<PictureURL>{url}</PictureURL>" for url in producto["fotos"][:8]])
 
     specifics_xml = ""
     for k, v in seo["specifics"].items():
@@ -728,16 +643,13 @@ Devuelve este JSON exacto:
     specifics_xml += "<NameValueList><Name>MPN</Name><Value>No aplicable</Value></NameValueList>"
     specifics_xml += "<NameValueList><Name>EAN</Name><Value>No aplicable</Value></NameValueList>"
 
-    perfiles = obtener_politicas_vendedor_ebay()
-    nac_srv, intl_srv = ("", "") if perfiles.get("opted_in") else obtener_servicios_envio_ebay_es()
-
     ultimo_error = "No se pudo validar categoría."
     ultima_cat = candidatos_cat[0][0]
 
-    for cid, cname in candidatos_cat[:5]:
+    for cid, cname in candidatos_cat[:3]:
         ultima_cat = cid
         print(f"🚀 [Agente 3] Intentando publicar en subcategoría {cid} ({cname})...")
-        xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles, nac_srv, intl_srv)
+        xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles)
         res = ebay_xml_call("AddFixedPriceItem", xml)
 
         match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
@@ -747,9 +659,11 @@ Devuelve este JSON exacto:
 
         errores = [html.unescape(e) for e in re.findall(r"<LongMessage>(.*?)</LongMessage>", res)]
         ultimo_error = " | ".join(errores) if errores else html.unescape(res[:500])
-        print(f"⚠️ Subcategoría {cid} pidió ajuste ({ultimo_error}), probando siguiente...")
+        print(f"⚠️ Aviso eBay en {cid}: {ultimo_error}")
 
-    print(f"⚠️ eBay devolvió aviso/error final: {ultimo_error}")
+        if "vendedor pueden estar infringiendo" in ultimo_error.lower() or "seller" in ultimo_error.lower():
+            break
+
     return seo, "ERROR_EBAY", ultima_cat, ultimo_error
 
 # ==============================================================================
@@ -769,7 +683,7 @@ def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
         payload_pin = {
             "board_id": PINTEREST_BOARD_ID,
             "title": seo["titulo"][:100],
-            "description": f"{gancho} ✨ Envío gratis desde Europa en 3-7 días.",
+            "description": f"{gancho} ✨ Envío desde Europa en 3-7 días.",
             "link": ebay_link,
             "media_source": {
                 "source_type": "image_url",
@@ -805,7 +719,7 @@ def agente_5_atencion_clientes():
             pregunta = msg.find(".//eb:Body", ns).text
 
             borrador = llamar_groq(
-                "Eres soporte oficial de nuestra tienda en eBay Europa. Sé amable y directo. Enviamos gratis desde Europa en 3-7 días laborables con seguimiento y 14 días de garantía.",
+                "Eres soporte oficial de nuestra tienda en eBay Europa. Sé amable y directo. Enviamos desde Europa en 3-7 días laborables con seguimiento y 14 días de garantía.",
                 f"El comprador '{sender}' pregunta: '{pregunta}'. Redacta la respuesta lista para enviar:",
                 json_mode=False
             )
@@ -829,31 +743,46 @@ def agente_5_atencion_clientes():
 if __name__ == "__main__":
     print("=== ARRANCANDO ZONA 2 PRO: MULTI-MERCADO UE + TRÁFICO GRATIS ===")
     skus_activos, podados, ganadores = agente_6_datos_podar_catalogo()
-    candidato = agente_1_cazar_tendencia(skus_activos)
-    variantes = agente_2_diseno_multimedia(candidato)
-    seo, item_id, cat_id, error_ebay = agente_3_publicar_tienda_europa(candidato, variantes)
-    canales = agente_7_promocion_gratis_multicanal(candidato, seo, variantes, item_id)
-    agente_5_atencion_clientes()
+    perfiles = obtener_politicas_vendedor_ebay()
+    candidatos = agente_1_cazar_candidatos_seguros(skus_activos, max_candidatos=4)
 
-    if error_ebay:
-        enviar_telegram(f"⚠️ AVISO DE EBAY AL PUBLICAR:\n{error_ebay}\n\nRevisa ese ajuste en tu cuenta y vuelve a lanzar.")
-    else:
-        texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "En fase de testeo (30 pruebas)"
-        informe = (
-            f"🟢 ZONA 2 PRO — PRODUCTO PUBLICADO EN TODA LA UE\n\n"
-            f"📦 Producto: {seo['titulo']}\n"
-            f"🏭 Almacén: {candidato['almacen']} (Europa)\n"
-            f"💶 Venta: {candidato['precio_venta']}€ (Coste CJ: {candidato['coste_cj']}€ | Limpio: +{candidato['beneficio_neto']}€)\n"
-            f"🌍 Mercados gratis: {canales}\n"
-            f"🎨 Creativos: 10 imágenes + 1 Vídeo Reel MP4 + CSV Canva Pro\n"
-            f"✂️ Limpieza hoy: {podados} productos sin ventas retirados\n"
-            f"👑 Ganadores activos: {texto_ganadores}"
-        )
+    publicado_ok = False
+    ultimo_error = ""
+
+    for cand in candidatos:
+        seo, item_id, cat_id, error_ebay = agente_3_publicar_tienda_europa(cand, perfiles)
+        if not error_ebay and item_id != "ERROR_EBAY":
+            variantes = agente_2_diseno_multimedia(cand)
+            canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
+            agente_5_atencion_clientes()
+
+            texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "En fase de testeo (30 pruebas)"
+            informe = (
+                f"🟢 ZONA 2 PRO — PRODUCTO PUBLICADO EN TODA LA UE\n\n"
+                f"📦 Producto: {seo['titulo']}\n"
+                f"🏭 Almacén: {cand['almacen']} (Europa)\n"
+                f"💶 Venta: {cand['precio_venta']}€ (Coste CJ: {cand['coste_cj']}€ | Limpio: +{cand['beneficio_neto']}€)\n"
+                f"🌍 Mercados gratis: {canales}\n"
+                f"🎨 Creativos: 10 imágenes + 1 Vídeo Reel MP4 + CSV Canva Pro\n"
+                f"✂️ Limpieza hoy: {podados} productos sin ventas retirados\n"
+                f"👑 Ganadores activos: {texto_ganadores}"
+            )
+            enviar_telegram(
+                informe,
+                botones=[[
+                    {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"},
+                    {"text": "✅ Campaña 0€ Activa", "callback_data": f"OK_{item_id}"}
+                ]]
+            )
+            publicado_ok = True
+            break
+        else:
+            ultimo_error = error_ebay
+            print("⏭️ Probando siguiente producto candidato seguro...")
+
+    if not publicado_ok:
         enviar_telegram(
-            informe,
-            botones=[[
-                {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"},
-                {"text": "✅ Campaña 0€ Activa", "callback_data": f"OK_{item_id}"}
-            ]]
+            f"⚠️ AVISO DE EBAY AL PUBLICAR:\n{ultimo_error}\n\n"
+            f"👉 Si eBay menciona política de vendedor o fondos retenidos, entra en ebay.es > Mi eBay > Cuenta > Pagos y verifica tu IBAN/tarjeta y teléfono de vendedor (requisito único antes del primer anuncio por API)."
         )
     print("=== CICLO COMPLETADO ===")
