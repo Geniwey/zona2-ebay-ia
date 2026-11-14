@@ -34,7 +34,7 @@ EBAY_XML_URL = "https://api.ebay.com/ws/api.dll"
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 
 # ==============================================================================
-# MÓDULO 0: AUTO-DETECCIÓN DE CREDENCIALES, MODELOS IA Y SERVICIOS DE EBAY
+# MÓDULO 0: AUTO-DETECCIÓN DE CREDENCIALES, MODELOS IA Y UTILIDADES
 # ==============================================================================
 def verificar_formato_secretos():
     print(f"🔎 [Diagnóstico] EBAY_APP_ID len={len(EBAY_APP_ID)} | inicio={EBAY_APP_ID[:12]}...")
@@ -176,7 +176,7 @@ def ebay_xml_call(call_name, xml_body):
         "Content-Type": "text/xml; charset=utf-8",
         "X-EBAY-API-IAF-TOKEN": EBAY_ACTIVE_TOKEN
     }
-    resp = requests.post(EBAY_XML_URL, headers=headers, data=xml_body.encode("utf-8"), timeout=25)
+    resp = requests.post(EBAY_XML_URL, headers=headers, data=xml_body.encode("utf-8"), timeout=30)
     resp.encoding = "utf-8"
     return resp.text
 
@@ -391,14 +391,14 @@ def agente_2_diseno_multimedia(producto):
             lienzo_rgb.save(ruta_jpg, quality=92)
 
             if idx < 5:
-                frame_vert = Image.new("RGB", (1080, 1920), color_fondo)
-                frame_vert.paste(lienzo_rgb, (0, 420))
+                frame_vert = Image.new("RGB", (1088, 1920), color_fondo)
+                frame_vert.paste(lienzo_rgb, (4, 420))
                 arr_frame = np.array(frame_vert)
                 for _ in range(30):
                     frames_video.append(arr_frame)
 
         if frames_video:
-            imageio.mimsave("anuncios_generados/reel_tiktok_viral.mp4", frames_video, fps=15, macro_block_size=8)
+            imageio.mimsave("anuncios_generados/reel_tiktok_viral.mp4", frames_video, fps=15)
             print("🎬 [Agente 2] Vídeo vertical MP4 generado con éxito.")
     except Exception as e:
         print(f"Aviso en renderizado multimedia: {e}")
@@ -408,32 +408,95 @@ def agente_2_diseno_multimedia(producto):
 # ==============================================================================
 # AGENTE 3 (TIENDA MULTI-PAÍS): Publica para España + Alemania + Francia + Italia
 # ==============================================================================
-def detectar_categoria_ebay_es(query_es, titulo_es=""):
-    palabras_titulo = [w for w in re.findall(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]{4,}", titulo_es) if w.lower() not in {"para", "con", "envio", "gratis", "pack", "piezas"}]
-    candidatos_query = [query_es] + palabras_titulo[:3] + ["lampara led", "juguete educativo", "organizador cocina", "accesorios hogar"]
+def quitar_tildes(texto):
+    return (
+        str(texto).lower()
+        .replace("á", "a").replace("é", "e").replace("í", "i")
+        .replace("ó", "o").replace("ú", "u").replace("ü", "u")
+    )
 
-    for q in candidatos_query:
-        q_limpia = limpiar_xml(q)
-        if not q_limpia:
-            continue
-        xml = f"""<?xml version="1.0" encoding="utf-8"?>
-        <GetSuggestedCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-          <Query>{q_limpia}</Query>
-        </GetSuggestedCategoriesRequest>"""
-        res = ebay_xml_call("GetSuggestedCategories", xml)
-        try:
-            root = ET.fromstring(res)
-            ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
-            cat_el = root.find(".//eb:SuggestedCategory/eb:Category/eb:CategoryID", ns)
-            if cat_el is not None and cat_el.text:
-                cat_name_el = root.find(".//eb:SuggestedCategory/eb:Category/eb:CategoryName", ns)
-                nombre_cat = cat_name_el.text if cat_name_el is not None else ""
-                print(f"📂 [Agente 3] Categoría hoja seleccionada en eBay ES: {cat_el.text} ({nombre_cat}) [query='{q_limpia}']")
-                return cat_el.text
-        except Exception:
-            pass
+def obtener_categoria_hoja_ebay_es(query_es, titulo_es=""):
+    print("📂 [Agente 3] Consultando árbol oficial de categorías hoja en eBay España...")
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+    <GetCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+      <CategorySiteID>186</CategorySiteID>
+      <DetailLevel>ReturnAll</DetailLevel>
+      <ViewAllNodes>true</ViewAllNodes>
+    </GetCategoriesRequest>"""
+    res = ebay_xml_call("GetCategories", xml)
 
-    return "11700"
+    hojas = []
+    nombres_por_id = {}
+    padres_por_id = {}
+
+    try:
+        root = ET.fromstring(res)
+        ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
+        for cat in root.findall(".//eb:Category", ns):
+            cid_el = cat.find("eb:CategoryID", ns)
+            cname_el = cat.find("eb:CategoryName", ns)
+            cpid_el = cat.find("eb:CategoryParentID", ns)
+            leaf_el = cat.find("eb:LeafCategory", ns)
+            if cid_el is None or cname_el is None:
+                continue
+            cid = cid_el.text
+            cname = cname_el.text or ""
+            nombres_por_id[cid] = cname
+            if cpid_el is not None:
+                padres_por_id[cid] = cpid_el.text
+            if leaf_el is not None and leaf_el.text == "true":
+                hojas.append((cid, cname))
+    except Exception as e:
+        print(f"⚠️ Aviso leyendo árbol de categorías de eBay ES: {e}")
+
+    if not hojas:
+        return "172009", "172009"
+
+    stopwords = {"para", "con", "sin", "los", "las", "del", "por", "una", "uno", "envio", "gratis", "pack", "piezas", "europa", "nuevo"}
+    palabras = [
+        quitar_tildes(w) for w in re.findall(r"[A-Za-zÁÉÍÓÚáéíóúÑñÜü]{3,}", f"{query_es} {titulo_es}")
+        if quitar_tildes(w) not in stopwords
+    ]
+
+    mejor_id = None
+    mejor_nombre = ""
+    mejor_score = 0
+    respaldo_id = hojas[0][0]
+
+    for cid, cname in hojas:
+        ruta_nombres = [cname]
+        curr = cid
+        for _ in range(5):
+            p = padres_por_id.get(curr)
+            if not p or p == curr or p not in nombres_por_id:
+                break
+            ruta_nombres.append(nombres_por_id[p])
+            curr = p
+
+        texto_cat = quitar_tildes(" ".join(ruta_nombres))
+        cname_norm = quitar_tildes(cname)
+
+        if cname_norm == "otros" and "casa" in texto_cat:
+            respaldo_id = cid
+
+        score = 0
+        for p in palabras:
+            if p in cname_norm:
+                score += 3
+            elif p in texto_cat:
+                score += 1
+
+        if score > mejor_score:
+            mejor_score = score
+            mejor_id = cid
+            mejor_nombre = " > ".join(reversed(ruta_nombres))
+
+    if mejor_id and mejor_score > 0:
+        print(f"✅ [Agente 3] Categoría hoja verificada: {mejor_id} ({mejor_nombre})")
+        return mejor_id, respaldo_id
+
+    print(f"✅ [Agente 3] Categoría hoja general verificada: {respaldo_id}")
+    return respaldo_id, respaldo_id
 
 def obtener_politicas_vendedor_ebay():
     xml = """<?xml version="1.0" encoding="utf-8"?>
@@ -653,7 +716,7 @@ Devuelve este JSON exacto:
     seo = normalizar_seo_listing(seo_raw, producto, texto_limpio)
     print(f"📝 [Agente 3] Título SEO generado: {seo['titulo']}")
 
-    cat_id = detectar_categoria_ebay_es(seo["query_categoria"], seo["titulo"])
+    cat_id, respaldo_cat_id = obtener_categoria_hoja_ebay_es(seo["query_categoria"], seo["titulo"])
     fotos_xml = "".join([f"<PictureURL>{url}</PictureURL>" for url in producto["fotos"]])
 
     specifics_xml = ""
@@ -676,14 +739,15 @@ Devuelve este JSON exacto:
         print(f"🎉 [Agente 3] ¡PUBLICADO EN EBAY! ItemID: {match_id.group(1)}")
         return seo, match_id.group(1), cat_id, None
 
-    if any(w in res.lower() for w in ["sellerprofiles", "business policies", "perfiles", "políticas del vendedor", "identificadores de las políticas"]):
-        print("🔄 [Agente 3] Reintentando publicación dejando que eBay aplique sus políticas por defecto...")
-        xml_sin_politicas = construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, None)
-        res = ebay_xml_call("AddFixedPriceItem", xml_sin_politicas)
+    # Si la subcategoría específica pide algún atributo extra, reintenta en categoría hoja general
+    if respaldo_cat_id and respaldo_cat_id != cat_id:
+        print(f"🔄 [Agente 3] Reintentando en categoría hoja general ({respaldo_cat_id})...")
+        xml_respaldo = construir_xml_publicacion(producto, seo, respaldo_cat_id, specifics_xml, fotos_xml, perfiles, nac_srv, intl_srv)
+        res = ebay_xml_call("AddFixedPriceItem", xml_respaldo)
         match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
         if match_id:
             print(f"🎉 [Agente 3] ¡PUBLICADO EN EBAY! ItemID: {match_id.group(1)}")
-            return seo, match_id.group(1), cat_id, None
+            return seo, match_id.group(1), respaldo_cat_id, None
 
     errores = [html.unescape(e) for e in re.findall(r"<LongMessage>(.*?)</LongMessage>", res)]
     err_msg = " | ".join(errores) if errores else html.unescape(res[:500])
