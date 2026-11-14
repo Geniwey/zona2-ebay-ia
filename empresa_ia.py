@@ -23,7 +23,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 EBAY_APP_ID = os.environ.get("EBAY_APP_ID", "").strip()
 EBAY_CERT_ID = os.environ.get("EBAY_CERT_ID", "").strip()
-EBAY_REFRESH_TOKEN = os.environ.get("EBAY_REFRESH_TOKEN", "").strip()
+RAW_REFRESH = os.environ.get("EBAY_REFRESH_TOKEN", "").strip()
+# Escudo anti-doble pegado: si se pegó dos veces seguidas, extrae solo el primero
+if RAW_REFRESH.count("v^1.1#") > 1:
+    EBAY_REFRESH_TOKEN = "v^1.1#" + RAW_REFRESH.split("v^1.1#")[1]
+else:
+    EBAY_REFRESH_TOKEN = RAW_REFRESH
+
 EBAY_STATIC_TOKEN = os.environ.get("EBAY_TOKEN", "").strip()
 
 PINTEREST_TOKEN = os.environ.get("PINTEREST_TOKEN", "").strip()
@@ -220,6 +226,8 @@ def agente_1_cazar_tendencia(skus_excluidos):
             res_cj = requests.get(url_cj, headers=headers_cj, timeout=15).json()
             if not res_cj.get("result"):
                 print(f"⚠️ CJ ({pais} | '{kw}'): {res_cj.get('message')}")
+                if "disabled" in str(res_cj.get("message", "")).lower():
+                    raise Exception("CJ tiene la API deshabilitada: entra en CJ > Authorization > API (pestaña API) y pulsa Unfreeze/Reactivate.")
                 continue
 
             productos_lista = (res_cj.get("data") or {}).get("list") or []
