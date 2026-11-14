@@ -1,0 +1,39 @@
+name: Zona 2 Pro - Multi-Europa y Trafico Gratis 24/7
+
+on:
+  schedule:
+    - cron: '0 7 */2 * *'
+  workflow_dispatch:
+
+jobs:
+  operar_empresa_ia:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código de Zona 2
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar librerías multimedia y de los Agentes
+        run: pip install -r requirements.txt
+
+      - name: Despertar a los 7 Agentes IA
+        env:
+          CJ_TOKEN: ${{ secrets.CJ_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
+          EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
+          EBAY_REFRESH_TOKEN: ${{ secrets.EBAY_REFRESH_TOKEN }}
+        run: python empresa_ia.py
+
+      - name: Guardar 10 Imágenes + Vídeo Reel MP4 + CSV Canva Pro
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pack-multimedia-10-anuncios-reel-canva
+          path: anuncios_generados/
