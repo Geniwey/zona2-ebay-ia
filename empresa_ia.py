@@ -3,6 +3,7 @@ import re
 import csv
 import html
 import json
+import math
 import time
 import base64
 import datetime
@@ -32,6 +33,10 @@ PINTEREST_BOARD_ID = os.environ.get("PINTEREST_BOARD_ID", "").strip()
 
 EBAY_XML_URL = "https://api.ebay.com/ws/api.dll"
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+
+# Parámetros de precios orientados a máxima velocidad de venta (cuentas nuevas)
+ENVIO_CJ_ESTIMADO_UE = 2.50     # Colchón para envío desde almacén europeo CJ
+BENEFICIO_MINIMO_OBJETIVO = 2.80  # Beneficio limpio mínimo garantizado por venta
 
 # Palabras bloqueadas por seguridad UE / políticas de cuentas nuevas en eBay
 PALABRAS_PROHIBIDAS_UE = {
@@ -235,8 +240,37 @@ def enviar_telegram(texto, botones=None):
         payload["reply_markup"] = {"inline_keyboard": botones}
     requests.post(url, json=payload, timeout=15)
 
+def calcular_economia_penetracion(coste_cj):
+    """Calcula precio competitivo (.95 €) garantizando beneficio limpio real tras envío CJ y comisión eBay + IVA."""
+    coste_total_cj = round(coste_cj + ENVIO_CJ_ESTIMADO_UE, 2)
+    tasa_ebay = 0.115 * 1.21   # 11.5% tarifa eBay + 21% IVA
+    fijo_ebay = 0.35 * 1.21    # 0.35€ fijo eBay + 21% IVA
+
+    precio_bruto = (coste_total_cj + fijo_ebay + BENEFICIO_MINIMO_OBJETIVO) / (1.0 - tasa_ebay)
+    precio_psicologico = math.floor(precio_bruto) + 0.95
+    if precio_psicologico < precio_bruto - 0.15:
+        precio_psicologico += 1.00
+
+    precio_venta = round(precio_psicologico, 2)
+    comision_ebay = round((precio_venta * 0.115 + 0.35) * 1.21, 2)
+    beneficio_neto = round(precio_venta - comision_ebay - coste_total_cj, 2)
+
+    # Suelo para Mejor Oferta automática (deja al menos 2.00€ limpios)
+    oferta_minima = round(max(precio_venta - 1.50, coste_total_cj + comision_ebay + 2.00), 2)
+    oferta_autoaceptar = round(max(precio_venta - 0.80, oferta_minima + 0.30), 2)
+
+    return {
+        "coste_cj": round(coste_cj, 2),
+        "coste_total_cj": coste_total_cj,
+        "precio_venta": precio_venta,
+        "comision_ebay": comision_ebay,
+        "beneficio_neto": beneficio_neto,
+        "oferta_minima": oferta_minima,
+        "oferta_autoaceptar": oferta_autoaceptar
+    }
+
 # ==============================================================================
-# AGENTE 6 (DATOS Y PODADOR): Audita los últimos 30 productos y borra muertos
+# AGENTE 6 (DATOS Y PODADOR): Audita catálogo activo y retira muertos a 14 días
 # ==============================================================================
 def agente_6_datos_podar_catalogo():
     print("📊 [Agente 6 - Datos] Auditando catálogo activo en eBay...")
@@ -288,6 +322,7 @@ def agente_6_datos_podar_catalogo():
                 </EndFixedPriceItemRequest>"""
                 ebay_xml_call("EndFixedPriceItem", end_xml)
                 eliminados += 1
+                print(f"✂️ [Agente 6] Retirado anuncio sin ventas tras {dias} días: {titulo_item[:40]}")
     except Exception as e:
         print(f"Aviso en lectura de catálogo activo: {e}")
 
@@ -301,7 +336,7 @@ def es_producto_seguro_ue(titulo_en):
     return len(palabras.intersection(PALABRAS_PROHIBIDAS_UE)) == 0
 
 def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
-    print("🔍 [Agente 1 - Tendencias] Rastreando productos seguros en almacenes de la Unión Europea...")
+    print("🔍 [Agente 1 - Tendencias] Rastreando productos de alta rotación en almacenes de la Unión Europea...")
     headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN}
     lista_keywords = ["organizer", "lamp", "holder", "storage", "decor", "rack", "light"]
     almacenes_ue = ["DE", "FR", "ES", "PL"]
@@ -334,10 +369,8 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
                 except ValueError:
                     continue
 
-                if 3.0 <= coste_cj <= 16.0:
-                    precio_venta = round((coste_cj * 2.6) + 1.50, 2)
-                    comision_ebay = round(precio_venta * 0.135, 2)
-                    beneficio_neto = round(precio_venta - comision_ebay - coste_cj, 2)
+                if 2.5 <= coste_cj <= 15.0:
+                    eco = calcular_economia_penetracion(coste_cj)
 
                     time.sleep(1.2)
                     det_url = f"https://developers.cjdropshipping.com/api2.0/v1/product/query?pid={pid}"
@@ -355,16 +388,20 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
                         continue
 
                     vistos.add(pid)
-                    print(f"✅ Candidato seguro en {pais}: {titulo_en} ({coste_cj}€ -> {precio_venta}€)")
+                    print(f"✅ Candidato competitivo en {pais}: {titulo_en} ({coste_cj}€ -> {eco['precio_venta']}€ | Limpio +{eco['beneficio_neto']}€)")
                     candidatos.append({
                         "sku": pid,
                         "almacen": pais,
                         "titulo_en": titulo_en,
                         "descripcion_en": det_data.get("description") or titulo_en,
                         "fotos": fotos_limpias,
-                        "coste_cj": coste_cj,
-                        "precio_venta": precio_venta,
-                        "beneficio_neto": beneficio_neto
+                        "coste_cj": eco["coste_cj"],
+                        "coste_total_cj": eco["coste_total_cj"],
+                        "precio_venta": eco["precio_venta"],
+                        "comision_ebay": eco["comision_ebay"],
+                        "beneficio_neto": eco["beneficio_neto"],
+                        "oferta_minima": eco["oferta_minima"],
+                        "oferta_autoaceptar": eco["oferta_autoaceptar"]
                     })
                     if len(candidatos) >= max_candidatos:
                         return candidatos
@@ -385,7 +422,7 @@ def agente_2_diseno_multimedia(producto):
 
     os.makedirs("anuncios_generados", exist_ok=True)
     lista_variantes = disenos.get("variantes") or [
-        {"id": i + 1, "gancho": "OFERTA EUROPA HOY", "angulo": "Envío rápido desde almacén europeo", "color_hex": "#0F172A"}
+        {"id": i + 1, "gancho": "PRECIO DIRECTO UE", "angulo": "Envío rápido desde almacén europeo", "color_hex": "#0F172A"}
         for i in range(10)
     ]
     lista_variantes = lista_variantes[:10]
@@ -432,7 +469,7 @@ def agente_2_diseno_multimedia(producto):
     return lista_variantes
 
 # ==============================================================================
-# AGENTE 3 (TIENDA MULTI-PAÍS): Publica para España + Alemania + Francia + Italia
+# AGENTE 3 (TIENDA MULTI-PAÍS): Publica en eBay España / UE con Mejor Oferta
 # ==============================================================================
 def obtener_categorias_hoja_ebay_es(query_es, titulo_es=""):
     print("📂 [Agente 3] Buscando subcategorías hoja válidas en eBay España (Tree 186)...")
@@ -517,7 +554,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         or seo_raw.get("title")
         or seo_raw.get("Title")
         or seo_raw.get("titulo_seo")
-        or f"{producto['titulo_en'][:55]} Envio Gratis UE"
+        or f"{producto['titulo_en'][:55]} Envio Europa"
     ).strip()
 
     for prohibida in ["gratis", "regalo", "oferta", "100%", "garantizado"]:
@@ -558,7 +595,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         "specifics": specifics
     }
 
-def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles_vendedor):
+def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles_vendedor, incluir_mejor_oferta=True):
     titulo_xml = limpiar_xml(seo["titulo"])
     pais_almacen = producto.get("almacen", "DE")
 
@@ -573,6 +610,17 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
             partes_perfil.append(f"<SellerPaymentProfile><PaymentProfileID>{perfiles_vendedor['payment']}</PaymentProfileID></SellerPaymentProfile>")
         if partes_perfil:
             bloque_politicas = f"<SellerProfiles>{''.join(partes_perfil)}</SellerProfiles>"
+
+    bloque_mejor_oferta = ""
+    if incluir_mejor_oferta and producto["oferta_autoaceptar"] < producto["precio_venta"]:
+        bloque_mejor_oferta = f"""
+        <BestOfferDetails>
+          <BestOfferEnabled>true</BestOfferEnabled>
+        </BestOfferDetails>
+        <ListingDetails>
+          <BestOfferAutoAcceptPrice currencyID="EUR">{producto['oferta_autoaceptar']}</BestOfferAutoAcceptPrice>
+          <MinimumBestOfferPrice currencyID="EUR">{producto['oferta_minima']}</MinimumBestOfferPrice>
+        </ListingDetails>"""
 
     return f"""<?xml version="1.0" encoding="utf-8"?>
     <AddFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
@@ -599,6 +647,7 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
             <MPN>No aplicable</MPN>
           </BrandMPN>
         </ProductListingDetails>
+        {bloque_mejor_oferta}
         {bloque_politicas}
         <Site>Spain</Site>
       </Item>
@@ -610,15 +659,15 @@ def agente_3_publicar_tienda_europa(producto, perfiles):
 
     seo_raw = llamar_groq(
         "Eres un experto en SEO y cumplimiento de políticas para eBay España. Prohibido usar palabras promocionales como 'gratis', 'oferta', '100%', marcas registradas, URLs o reclamos médicos. Devuelve únicamente JSON válido.",
-        f"""Traduce y optimiza este producto para eBay España de forma sobria y descriptiva.
+        f"""Traduce y optimiza este producto para eBay España con palabras clave que busquen los compradores reales.
 Producto: {producto['titulo_en']}
 Detalles: {texto_limpio}
 
 Devuelve este JSON exacto:
 {{
   "query_categoria": "2 palabras en español del objeto",
-  "titulo": "Título descriptivo en español de 55 a 75 caracteres sin palabras promocionales",
-  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara y objetiva del producto en español.</p><ul><li>Característica 1</li><li>Característica 2</li><li>Envío desde almacén europeo en 3 a 7 días laborables.</li></ul>",
+  "titulo": "Título descriptivo en español de 55 a 75 caracteres con palabras clave de búsqueda",
+  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara y objetiva del producto en español.</p><ul><li>Característica 1</li><li>Característica 2</li><li>Envío rápido desde almacén europeo en 3 a 7 días laborables.</li></ul>",
   "specifics": {{
     "Marca": "Sin marca",
     "Tipo": "Accesorio de hogar",
@@ -649,8 +698,13 @@ Devuelve este JSON exacto:
     for cid, cname in candidatos_cat[:3]:
         ultima_cat = cid
         print(f"🚀 [Agente 3] Intentando publicar en subcategoría {cid} ({cname})...")
-        xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles)
+        xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles, incluir_mejor_oferta=True)
         res = ebay_xml_call("AddFixedPriceItem", xml)
+
+        # Si la subcategoría concreta no admite Mejor Oferta, reintenta al instante sin ella
+        if "BestOffer" in res or "mejor oferta" in res.lower():
+            xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles, incluir_mejor_oferta=False)
+            res = ebay_xml_call("AddFixedPriceItem", xml)
 
         match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
         if match_id:
@@ -671,7 +725,7 @@ Devuelve este JSON exacto:
 # ==============================================================================
 def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
     ebay_link = f"https://www.ebay.es/itm/{item_id}"
-    canales_activos = ["eBay ES", "eBay DE/FR/IT (UE)", "Vídeo Reel MP4", "Lote Canva CSV"]
+    canales_activos = ["eBay ES/UE", "Mejor Oferta Auto", "Vídeo Reel MP4", "Lote Canva CSV"]
 
     if PINTEREST_TOKEN and PINTEREST_BOARD_ID and item_id != "ERROR_EBAY":
         url_pin = "https://api.pinterest.com/v5/pins"
@@ -741,7 +795,7 @@ def agente_5_atencion_clientes():
 # EJECUCIÓN MAESTRA DE LOS 7 AGENTES
 # ==============================================================================
 if __name__ == "__main__":
-    print("=== ARRANCANDO ZONA 2 PRO: MULTI-MERCADO UE + TRÁFICO GRATIS ===")
+    print("=== ARRANCANDO ZONA 2 PRO: MODO VENTAS RÁPIDAS UE 24/7 ===")
     skus_activos, podados, ganadores = agente_6_datos_podar_catalogo()
     perfiles = obtener_politicas_vendedor_ebay()
     candidatos = agente_1_cazar_candidatos_seguros(skus_activos, max_candidatos=4)
@@ -756,22 +810,22 @@ if __name__ == "__main__":
             canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
             agente_5_atencion_clientes()
 
-            texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "En fase de testeo (30 pruebas)"
+            texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "Construyendo primeras ventas"
             informe = (
-                f"🟢 ZONA 2 PRO — PRODUCTO PUBLICADO EN TODA LA UE\n\n"
+                f"🟢 ZONA 2 PRO — PRODUCTO PUBLICADO (MODO VENTAS)\n\n"
                 f"📦 Producto: {seo['titulo']}\n"
-                f"🏭 Almacén: {cand['almacen']} (Europa)\n"
-                f"💶 Venta: {cand['precio_venta']}€ (Coste CJ: {cand['coste_cj']}€ | Limpio: +{cand['beneficio_neto']}€)\n"
-                f"🌍 Mercados gratis: {canales}\n"
-                f"🎨 Creativos: 10 imágenes + 1 Vídeo Reel MP4 + CSV Canva Pro\n"
+                f"🏭 Almacén: {cand['almacen']} (Unión Europea)\n"
+                f"💶 PVP: {cand['precio_venta']}€ (Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
+                f"📊 Desglose real: Prod {cand['coste_cj']}€ + Envío est. {ENVIO_CJ_ESTIMADO_UE}€ + Com. eBay {cand['comision_ebay']}€\n"
+                f"💰 Limpio garantizado: +{cand['beneficio_neto']}€\n"
+                f"🌍 Activo en: {canales}\n"
                 f"✂️ Limpieza hoy: {podados} productos sin ventas retirados\n"
                 f"👑 Ganadores activos: {texto_ganadores}"
             )
             enviar_telegram(
                 informe,
                 botones=[[
-                    {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"},
-                    {"text": "✅ Campaña 0€ Activa", "callback_data": f"OK_{item_id}"}
+                    {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"}
                 ]]
             )
             publicado_ok = True
@@ -783,6 +837,6 @@ if __name__ == "__main__":
     if not publicado_ok:
         enviar_telegram(
             f"⚠️ AVISO DE EBAY AL PUBLICAR:\n{ultimo_error}\n\n"
-            f"👉 Si eBay menciona política de vendedor o fondos retenidos, entra en ebay.es > Mi eBay > Cuenta > Pagos y verifica tu IBAN/tarjeta y teléfono de vendedor (requisito único antes del primer anuncio por API)."
+            f"El bot lo volverá a intentar automáticamente en el próximo ciclo programado."
         )
     print("=== CICLO COMPLETADO ===")
