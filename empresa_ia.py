@@ -24,9 +24,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 EBAY_APP_ID = os.environ.get("EBAY_APP_ID", "").strip()
 EBAY_CERT_ID = os.environ.get("EBAY_CERT_ID", "").strip()
 RAW_REFRESH = os.environ.get("EBAY_REFRESH_TOKEN", "").strip()
-# Escudo anti-doble pegado: si se pegó dos veces seguidas, extrae solo el primero
 if RAW_REFRESH.count("v^1.1#") > 1:
-    EBAY_REFRESH_TOKEN = "v^1.1#" + RAW_REFRESH.split("v^1.1#")[1]
+    EBAY_REFRESH_TOKEN = "v^1.1#" + RAW_REFRESH.split("v^1.1#")[1].strip()
 else:
     EBAY_REFRESH_TOKEN = RAW_REFRESH
 
@@ -106,10 +105,12 @@ def ebay_xml_call(call_name, xml_body):
         "X-EBAY-API-SITEID": "186",
         "X-EBAY-API-CALL-NAME": call_name,
         "X-EBAY-API-COMPATIBILITY-LEVEL": "1149",
-        "Content-Type": "text/xml",
+        "Content-Type": "text/xml; charset=utf-8",
         "X-EBAY-API-IAF-TOKEN": EBAY_ACTIVE_TOKEN
     }
-    return requests.post(EBAY_XML_URL, headers=headers, data=xml_body.encode("utf-8"), timeout=25).text
+    resp = requests.post(EBAY_XML_URL, headers=headers, data=xml_body.encode("utf-8"), timeout=25)
+    resp.encoding = "utf-8"
+    return resp.text
 
 def enviar_telegram(texto, botones=None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
