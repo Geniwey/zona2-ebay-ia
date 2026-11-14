@@ -1,11 +1,11 @@
-name: Zona 2 Pro - Tienda Automatica eBay UE
+name: Zona 2 Pro - Modo Francotirador eBay UE
 
 on:
   workflow_dispatch:
   schedule:
-    # Vigilancia diaria (09:00 y 17:00 hora España): tramita pedidos, autopaga CJ Wallet y sube trackings
-    # Publicación de productos nuevos: Lunes 09:00, Miércoles 17:00, Viernes 17:00 y Domingo 17:00
-    - cron: '0 8,16 * * *'
+    # Vigilancia diaria (09:00 y 16:00 hora España): pedidos, tracking y poda antes del día 30 (0€ extra)
+    # Publicación semanal: solo los Domingos a las 16:00h (2h antes del pico máximo semanal de eBay)
+    - cron: '0 8,15 * * *'
 
 jobs:
   operar_empresa_ia:
