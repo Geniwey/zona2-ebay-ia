@@ -1,15 +1,23 @@
-name: Zona 2 Pro - Multi-Europa y Trafico Gratis 24/7
+name: Zona 2 Pro - Tienda Automatica eBay UE
 
 on:
-  schedule:
-    - cron: '0 7 */2 * *'
   workflow_dispatch:
+  schedule:
+    # Horarios óptimos eBay Europa (UTC -> España CET):
+    # Lunes 09:00 (limpieza 14d + reposición)
+    # Miércoles 17:00 (indexado antes del pico 19:00-21:30)
+    # Viernes 17:00 (listo para compras de sábado)
+    # Domingo 16:00 (indexado 2h antes del pico máximo semanal 18:00-22:00)
+    - cron: '0 8 * * 1'
+    - cron: '0 16 * * 3,5'
+    - cron: '0 15 * * 0'
 
 jobs:
   operar_empresa_ia:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Descargar código de Zona 2
+      - name: Descargar codigo de Zona 2
         uses: actions/checkout@v4
 
       - name: Configurar Python 3.11
@@ -17,10 +25,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar librerías multimedia y de los Agentes
-        run: pip install -r requirements.txt
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Despertar a los 7 Agentes IA
+      - name: Ejecutar los 7 Agentes IA
         env:
           CJ_TOKEN: ${{ secrets.CJ_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -29,11 +39,15 @@ jobs:
           EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
           EBAY_CERT_ID: ${{ secrets.EBAY_CERT_ID }}
           EBAY_REFRESH_TOKEN: ${{ secrets.EBAY_REFRESH_TOKEN }}
+          EBAY_TOKEN: ${{ secrets.EBAY_TOKEN }}
+          PINTEREST_TOKEN: ${{ secrets.PINTEREST_TOKEN }}
+          PINTEREST_BOARD_ID: ${{ secrets.PINTEREST_BOARD_ID }}
         run: python empresa_ia.py
 
-      - name: Guardar 10 Imágenes + Vídeo Reel MP4 + CSV Canva Pro
+      - name: Guardar Pack Multimedia (10 Anuncios + Reel MP4 + CSV Canva)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pack-multimedia-10-anuncios-reel-canva
           path: anuncios_generados/
+          if-no-files-found: ignore
