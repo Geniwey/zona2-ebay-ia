@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import json
+import time
 import base64
 import datetime
 import requests
@@ -34,7 +35,13 @@ EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 # ==============================================================================
 # MÓDULO 0: AUTO-RENOVACIÓN DEL TOKEN DE EBAY Y UTILIDADES BASE
 # ==============================================================================
+def verificar_formato_secretos():
+    print(f"🔎 [Diagnóstico] EBAY_APP_ID len={len(EBAY_APP_ID)} | inicio={EBAY_APP_ID[:12]}...")
+    print(f"🔎 [Diagnóstico] EBAY_CERT_ID len={len(EBAY_CERT_ID)} | inicio={EBAY_CERT_ID[:8]}...fin={EBAY_CERT_ID[-4:]}")
+    print(f"🔎 [Diagnóstico] EBAY_REFRESH_TOKEN len={len(EBAY_REFRESH_TOKEN)} | inicio={EBAY_REFRESH_TOKEN[:10]}...fin={EBAY_REFRESH_TOKEN[-6:]}")
+
 def obtener_token_ebay_vivo():
+    verificar_formato_secretos()
     if EBAY_APP_ID and EBAY_CERT_ID and EBAY_REFRESH_TOKEN:
         credenciales = f"{EBAY_APP_ID}:{EBAY_CERT_ID}"
         b64_auth = base64.b64encode(credenciales.encode("utf-8")).decode("utf-8")
@@ -48,10 +55,10 @@ def obtener_token_ebay_vivo():
         }
         res = requests.post(EBAY_OAUTH_URL, headers=headers, data=data, timeout=15)
         if res.status_code == 200:
-            print("🔑 [Seguridad] Token de eBay renovado automáticamente.")
+            print("🔑 [Seguridad] Token de eBay renovado automáticamente con éxito.")
             return res.json().get("access_token")
         else:
-            print(f"⚠️ Error renovando token eBay: {res.text}")
+            print(f"⚠️ Error renovando token eBay ({res.status_code}): {res.text}")
     return EBAY_STATIC_TOKEN
 
 EBAY_ACTIVE_TOKEN = obtener_token_ebay_vivo()
@@ -59,8 +66,11 @@ EBAY_ACTIVE_TOKEN = obtener_token_ebay_vivo()
 def obtener_access_token_cj():
     url = "https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken"
     res = requests.post(url, json={"apiKey": CJ_TOKEN}, timeout=15).json()
+    time.sleep(1.2)
     if res.get("result") and res.get("data", {}).get("accessToken"):
+        print("🔑 [CJ Dropshipping] Access Token obtenido correctamente.")
         return res["data"]["accessToken"]
+    print(f"⚠️ Aviso token CJ: {res.get('message', 'Usando API Key directa')}")
     return CJ_TOKEN
 
 CJ_ACCESS_TOKEN = obtener_access_token_cj()
@@ -109,6 +119,10 @@ def enviar_telegram(texto, botones=None):
 # ==============================================================================
 def agente_6_datos_podar_catalogo():
     print("📊 [Agente 6 - Datos] Auditando catálogo activo en eBay...")
+    if not EBAY_ACTIVE_TOKEN:
+        print("⚠️ Sin token activo de eBay, saltando auditoría inicial.")
+        return [], 0, []
+
     xml = """<?xml version="1.0" encoding="utf-8"?>
     <GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
       <ActiveList>
@@ -159,10 +173,10 @@ def agente_6_datos_podar_catalogo():
     return skus_activos, eliminados, ganadores
 
 # ==============================================================================
-# AGENTE 1 (TENDENCIAS): Escanea Amazon Movers & Shakers + CJ Almacén Alemania
+# AGENTE 1 (TENDENCIAS): Escanea Amazon + CJ Almacenes Unión Europea (DE/FR/ES/PL)
 # ==============================================================================
 def agente_1_cazar_tendencia(skus_excluidos):
-    print("🔍 [Agente 1 - Tendencias] Rastreando productos disparados en Amazon...")
+    print("🔍 [Agente 1 - Tendencias] Rastreando productos disparados en Amazon y almacenes UE...")
     headers_amz = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "es-ES,es;q=0.9"
@@ -183,64 +197,78 @@ def agente_1_cazar_tendencia(skus_excluidos):
         except Exception:
             pass
 
+    contexto_tendencias = titulos_amz if titulos_amz else ["LED ambient lamps", "kitchen organizers", "portable massagers", "smart home gadgets"]
+
     kw_json = llamar_groq(
         "Eres un analista de producto de dropshipping europeo. Devuelve únicamente JSON válido.",
-        f"Tendencias detectadas hoy: {titulos_amz}. Devuelve un JSON con una lista 'keywords' de 6 nombres en inglés de productos genéricos (sin marca, ligeros, alta demanda visual) para buscar en almacén europeo. Ejemplo: {{\"keywords\": [\"ocean wave projector\", \"led sunset lamp\", \"posture corrector\", \"electric lint remover\", \"massage gun\", \"motion sensor light\"]}}"
+        f"Tendencias detectadas hoy: {contexto_tendencias}. Devuelve un JSON con una lista 'keywords' de 5 palabras clave cortas en inglés (1 o 2 palabras cada una) de productos genéricos de alta demanda para buscar en almacén europeo. Ejemplo: {{\"keywords\": [\"lamp\", \"projector\", \"massager\", \"kitchen\", \"led\"]}}"
     )
 
     headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN}
-    lista_keywords = kw_json.get("keywords", ["sunset lamp", "galaxy projector", "neck massager"])
+    lista_keywords = kw_json.get("keywords", ["lamp", "led", "kitchen"])[:4]
     lista_keywords.append("")
 
-    for kw in lista_keywords:
-        url_cj = "https://developers.cjdropshipping.com/api2.0/v1/product/list?countryCode=DE&pageNum=1&pageSize=30"
-        if kw:
-            url_cj += f"&keyword={requests.utils.quote(kw)}"
+    almacenes_ue = ["DE", "FR", "ES", "PL"]
 
-        res_cj = requests.get(url_cj, headers=headers_cj, timeout=15).json()
-        productos_lista = (res_cj.get("data") or {}).get("list") or []
+    for pais in almacenes_ue:
+        for kw in lista_keywords:
+            time.sleep(1.2)
+            url_cj = f"https://developers.cjdropshipping.com/api2.0/v1/product/list?countryCode={pais}&pageNum=1&pageSize=40"
+            if kw:
+                url_cj += f"&keyword={requests.utils.quote(kw)}"
 
-        for prod in productos_lista:
-            pid = prod.get("pid")
-            if not pid or pid in skus_excluidos:
+            res_cj = requests.get(url_cj, headers=headers_cj, timeout=15).json()
+            if not res_cj.get("result"):
+                print(f"⚠️ CJ ({pais} | '{kw}'): {res_cj.get('message')}")
                 continue
 
-            precio_raw = str(prod.get("sellPrice", "0")).split("-")[0].strip()
-            try:
-                coste_cj = float(precio_raw)
-            except ValueError:
-                continue
+            productos_lista = (res_cj.get("data") or {}).get("list") or []
+            print(f"📦 CJ Almacén {pais} (kw='{kw or 'TODO'}'): {len(productos_lista)} productos encontrados.")
 
-            if 4.5 <= coste_cj <= 13.5:
-                precio_venta = round((coste_cj * 3) + 0.90, 2)
-                comision_ebay = round(precio_venta * 0.135, 2)
-                beneficio_neto = round(precio_venta - comision_ebay - coste_cj, 2)
-
-                det_url = f"https://developers.cjdropshipping.com/api2.0/v1/product/query?pid={pid}"
-                det_data = (requests.get(det_url, headers=headers_cj, timeout=15).json().get("data")) or {}
-
-                fotos = det_data.get("productImageSet") or [prod.get("productImage")]
-                if isinstance(fotos, str):
-                    try:
-                        fotos = json.loads(fotos)
-                    except Exception:
-                        fotos = [prod.get("productImage")]
-
-                fotos_limpias = [f for f in fotos if isinstance(f, str) and f.startswith("http")][:12]
-                if not fotos_limpias:
+            for prod in productos_lista:
+                pid = prod.get("pid")
+                if not pid or pid in skus_excluidos:
                     continue
 
-                return {
-                    "sku": pid,
-                    "titulo_en": prod.get("productNameEn", "Trending Gadget"),
-                    "descripcion_en": det_data.get("description") or prod.get("productNameEn", ""),
-                    "fotos": fotos_limpias,
-                    "coste_cj": coste_cj,
-                    "precio_venta": precio_venta,
-                    "beneficio_neto": beneficio_neto
-                }
+                precio_raw = str(prod.get("sellPrice", "0")).split("-")[0].strip()
+                try:
+                    coste_cj = float(precio_raw)
+                except ValueError:
+                    continue
 
-    raise Exception("No se encontraron candidatos nuevos hoy en Alemania.")
+                if 2.5 <= coste_cj <= 22.0:
+                    precio_venta = round((coste_cj * 2.8) + 1.50, 2)
+                    comision_ebay = round(precio_venta * 0.135, 2)
+                    beneficio_neto = round(precio_venta - comision_ebay - coste_cj, 2)
+
+                    time.sleep(1.2)
+                    det_url = f"https://developers.cjdropshipping.com/api2.0/v1/product/query?pid={pid}"
+                    det_data = (requests.get(det_url, headers=headers_cj, timeout=15).json().get("data")) or {}
+
+                    fotos = det_data.get("productImageSet") or [prod.get("productImage")]
+                    if isinstance(fotos, str):
+                        try:
+                            fotos = json.loads(fotos)
+                        except Exception:
+                            fotos = [prod.get("productImage")]
+
+                    fotos_limpias = [f for f in fotos if isinstance(f, str) and f.startswith("http")][:12]
+                    if not fotos_limpias:
+                        continue
+
+                    print(f"✅ Candidato seleccionado en {pais}: {prod.get('productNameEn')} ({coste_cj}€ -> {precio_venta}€)")
+                    return {
+                        "sku": pid,
+                        "almacen": pais,
+                        "titulo_en": prod.get("productNameEn", "Trending Gadget"),
+                        "descripcion_en": det_data.get("description") or prod.get("productNameEn", ""),
+                        "fotos": fotos_limpias,
+                        "coste_cj": coste_cj,
+                        "precio_venta": precio_venta,
+                        "beneficio_neto": beneficio_neto
+                    }
+
+    raise Exception("No se encontraron candidatos nuevos hoy en los almacenes de la UE.")
 
 # ==============================================================================
 # AGENTE 2 (DISEÑO): 10 Imágenes + Vídeo Vertical .MP4 (Reels/TikTok) + CSV Canva
@@ -275,7 +303,7 @@ def agente_2_diseno_multimedia(producto):
             draw.rectangle([(0, 0), (1080, 130)], fill=color_fondo)
             draw.text((40, 48), f"★ {v.get('gancho', 'TOP VENTAS').upper()} | {producto['precio_venta']}€ ★", fill="#FFFFFF")
             draw.rectangle([(0, 960), (1080, 1080)], fill="#111827")
-            draw.text((40, 1005), "ENVIO GRATIS EUROPA (5-7 DIAS) - GARANTIA 14 DIAS", fill="#10B981")
+            draw.text((40, 1005), "ENVIO GRATIS EUROPA (3-7 DIAS) - GARANTIA 14 DIAS", fill="#10B981")
 
             ruta_jpg = f"anuncios_generados/anuncio_v{v.get('id', idx+1)}.jpg"
             lienzo_rgb = lienzo.convert("RGB")
@@ -329,7 +357,7 @@ Devuelve este JSON exacto:
 {{
   "query_categoria": "2 palabras en español del objeto (ej: lampara proyector)",
   "titulo": "Título SEO en español de 70 a 80 caracteres con keyword principal al inicio",
-  "descripcion_html": "<div><h2>Calidad Premium - Stock en Europa</h2><p>Descripción persuasiva...</p><ul><li>Beneficio 1</li><li>Beneficio 2</li><li>Envío rápido desde almacén de Alemania a toda la UE en 3-7 días laborables.</li></ul></div>",
+  "descripcion_html": "<div><h2>Calidad Premium - Stock en Europa</h2><p>Descripción persuasiva...</p><ul><li>Beneficio 1</li><li>Beneficio 2</li><li>Envío rápido desde almacén europeo a toda la UE en 3-7 días laborables.</li></ul></div>",
   "specifics": {{
     "Marca": "Genérico",
     "Tipo": "Especificar tipo",
@@ -351,6 +379,8 @@ Devuelve este JSON exacto:
     specifics_xml += "<NameValueList><Name>MPN</Name><Value>No aplicable</Value></NameValueList>"
     specifics_xml += "<NameValueList><Name>EAN</Name><Value>No aplicable</Value></NameValueList>"
 
+    pais_almacen = producto.get("almacen", "DE")
+
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
     <AddFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
       <Item>
@@ -360,8 +390,8 @@ Devuelve este JSON exacto:
         <PrimaryCategory><CategoryID>{cat_id}</CategoryID></PrimaryCategory>
         <StartPrice>{producto['precio_venta']}</StartPrice>
         <ConditionID>1000</ConditionID>
-        <Country>DE</Country>
-        <Location>Alemania</Location>
+        <Country>{pais_almacen}</Country>
+        <Location>Unión Europea</Location>
         <Currency>EUR</Currency>
         <DispatchTimeMax>1</DispatchTimeMax>
         <ListingDuration>GTC</ListingDuration>
@@ -405,7 +435,7 @@ Devuelve este JSON exacto:
         return seo, match_id.group(1), cat_id, None
     else:
         err_match = re.search(r"<LongMessage>(.*?)</LongMessage>", res)
-        err_msg = err_match.group(1) if err_match else res[:300]
+        err_msg = err_match.group(1) if err_match else res[:400]
         print(f"⚠️ eBay devolvió aviso/error: {err_msg}")
         return seo, "ERROR_EBAY", cat_id, err_msg
 
@@ -426,7 +456,7 @@ def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
         payload_pin = {
             "board_id": PINTEREST_BOARD_ID,
             "title": seo["titulo"][:100],
-            "description": f"{gancho} ✨ Envío gratis desde Europa en 5-7 días.",
+            "description": f"{gancho} ✨ Envío gratis desde Europa en 3-7 días.",
             "link": ebay_link,
             "media_source": {
                 "source_type": "image_url",
@@ -443,6 +473,8 @@ def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
 # AGENTE 5 (CLIENTES): Atención automática 24/7
 # ==============================================================================
 def agente_5_atencion_clientes():
+    if not EBAY_ACTIVE_TOKEN:
+        return
     xml = """<?xml version="1.0" encoding="utf-8"?>
     <GetMemberMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
       <MailMessageType>AskSellerQuestion</MailMessageType>
@@ -460,7 +492,7 @@ def agente_5_atencion_clientes():
             pregunta = msg.find(".//eb:Body", ns).text
 
             borrador = llamar_groq(
-                "Eres soporte oficial de nuestra tienda en eBay Europa. Sé amable y directo. Enviamos gratis desde Alemania en 3-7 días laborables con seguimiento y 14 días de garantía.",
+                "Eres soporte oficial de nuestra tienda en eBay Europa. Sé amable y directo. Enviamos gratis desde Europa en 3-7 días laborables con seguimiento y 14 días de garantía.",
                 f"El comprador '{sender}' pregunta: '{pregunta}'. Redacta la respuesta lista para enviar:",
                 json_mode=False
             )
@@ -497,6 +529,7 @@ if __name__ == "__main__":
         informe = (
             f"🟢 ZONA 2 PRO — PRODUCTO PUBLICADO EN TODA LA UE\n\n"
             f"📦 Producto: {seo['titulo']}\n"
+            f"🏭 Almacén: {candidato['almacen']} (Europa)\n"
             f"💶 Venta: {candidato['precio_venta']}€ (Coste CJ: {candidato['coste_cj']}€ | Limpio: +{candidato['beneficio_neto']}€)\n"
             f"🌍 Mercados gratis: {canales}\n"
             f"🎨 Creativos: 10 imágenes + 1 Vídeo Reel MP4 + CSV Canva Pro\n"
