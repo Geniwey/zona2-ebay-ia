@@ -45,12 +45,10 @@ def obtener_token_ebay_vivo():
     if not EBAY_REFRESH_TOKEN:
         return EBAY_STATIC_TOKEN
 
-    # Si es un User Access Token directo (#f^0#r^0# o >2200 caracteres), se usa directamente
     if "#f^0#r^0#" in EBAY_REFRESH_TOKEN or len(EBAY_REFRESH_TOKEN) > 2200:
         print("🔑 [Seguridad] Detectado User Access Token directo de eBay. Conectando...")
         return EBAY_REFRESH_TOKEN
 
-    # Si es el Refresh Token de 18 meses (#r^0#p^3#), se renueva automáticamente
     if EBAY_APP_ID and EBAY_CERT_ID:
         credenciales = f"{EBAY_APP_ID}:{EBAY_CERT_ID}"
         b64_auth = base64.b64encode(credenciales.encode("utf-8")).decode("utf-8")
@@ -101,8 +99,28 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
     res = requests.post(url, headers=headers, json=payload, timeout=30).json()
+    if "choices" not in res:
+        print(f"⚠️ Respuesta inesperada de Groq: {res}")
+        return {} if json_mode else ""
     contenido = res["choices"][0]["message"]["content"].strip()
-    return json.loads(contenido) if json_mode else contenido
+    if not json_mode:
+        return contenido
+    try:
+        return json.loads(contenido)
+    except Exception:
+        match = re.search(r"\{.*\}", contenido, re.DOTALL)
+        return json.loads(match.group(0)) if match else {}
+
+def limpiar_xml(texto):
+    return (
+        str(texto)
+        .replace("&", "y")
+        .replace("<", "")
+        .replace(">", "")
+        .replace('"', "")
+        .replace("'", "")
+        .strip()
+    )
 
 def ebay_xml_call(call_name, xml_body):
     headers = {
@@ -294,7 +312,11 @@ def agente_2_diseno_multimedia(producto):
     )
 
     os.makedirs("anuncios_generados", exist_ok=True)
-    lista_variantes = disenos.get("variantes", [])[:10]
+    lista_variantes = disenos.get("variantes") or [
+        {"id": i + 1, "gancho": "OFERTA EUROPA HOY", "angulo": "Envío rápido desde almacén europeo", "color_hex": "#0F172A"}
+        for i in range(10)
+    ]
+    lista_variantes = lista_variantes[:10]
 
     with open("anuncios_generados/canva_lote_10_versiones.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -343,32 +365,70 @@ def agente_2_diseno_multimedia(producto):
 def detectar_categoria_ebay_es(query_es):
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
     <GetSuggestedCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-      <Query>{query_es}</Query>
+      <Query>{limpiar_xml(query_es)}</Query>
     </GetSuggestedCategoriesRequest>"""
     res = ebay_xml_call("GetSuggestedCategories", xml)
     match = re.search(r"<CategoryID>(\d+)</CategoryID>", res)
     return match.group(1) if match else "172008"
 
-def validar_listing_antes_de_publicar(seo_data, producto):
-    titulo = seo_data.get("titulo", "").strip()
+def normalizar_seo_listing(seo_raw, producto, texto_limpio):
+    if not isinstance(seo_raw, dict):
+        seo_raw = {}
+
+    titulo = (
+        seo_raw.get("titulo")
+        or seo_raw.get("title")
+        or seo_raw.get("Title")
+        or seo_raw.get("titulo_seo")
+        or f"{producto['titulo_en'][:60]} Envio Gratis UE"
+    ).strip()
+
     if len(titulo) > 80:
-        seo_data["titulo"] = titulo[:80].rsplit(" ", 1)[0]
-    descripcion = re.sub(r"https?://\S+|www\.\S+", "", seo_data.get("descripcion_html", ""))
-    seo_data["descripcion_html"] = descripcion
-    return seo_data
+        titulo = titulo[:80].rsplit(" ", 1)[0]
+
+    descripcion = (
+        seo_raw.get("descripcion_html")
+        or seo_raw.get("description_html")
+        or seo_raw.get("descripcion")
+        or seo_raw.get("description")
+        or f"<div><h2>Calidad Premium - Stock en Europa</h2><p>{texto_limpio[:600]}</p><ul><li>Envío rápido desde almacén europeo en 3-7 días laborables.</li><li>Garantía europea de devolución de 14 días.</li></ul></div>"
+    )
+    descripcion = re.sub(r"https?://\S+|www\.\S+", "", str(descripcion))
+
+    query_cat = (
+        seo_raw.get("query_categoria")
+        or seo_raw.get("category_query")
+        or "hogar gadget"
+    )
+
+    specifics = seo_raw.get("specifics")
+    if not isinstance(specifics, dict) or not specifics:
+        specifics = {
+            "Marca": "Genérico",
+            "Tipo": "Accesorio",
+            "Color": "Multicolor",
+            "Material": "Alta resistencia"
+        }
+
+    return {
+        "query_categoria": str(query_cat),
+        "titulo": titulo,
+        "descripcion_html": descripcion,
+        "specifics": specifics
+    }
 
 def agente_3_publicar_tienda_europa(producto, variantes):
     print("🛒 [Agente 3 - Tienda UE] Publicando en eBay con alcance a toda la Unión Europea...")
     texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:1500]
 
-    seo = llamar_groq(
+    seo_raw = llamar_groq(
         "Eres un experto en SEO para eBay Europa. Prohibido usar marcas registradas, URLs, emails o teléfonos. Devuelve únicamente JSON válido.",
         f"""Nombre original: {producto['titulo_en']}
 Detalles: {texto_limpio}
 
-Devuelve este JSON exacto:
+Devuelve este JSON exacto con estas claves en español:
 {{
-  "query_categoria": "2 palabras en español del objeto (ej: lampara proyector)",
+  "query_categoria": "2 palabras en español del objeto (ej: bloques magneticos)",
   "titulo": "Título SEO en español de 70 a 80 caracteres con keyword principal al inicio",
   "descripcion_html": "<div><h2>Calidad Premium - Stock en Europa</h2><p>Descripción persuasiva...</p><ul><li>Beneficio 1</li><li>Beneficio 2</li><li>Envío rápido desde almacén europeo a toda la UE en 3-7 días laborables.</li></ul></div>",
   "specifics": {{
@@ -380,15 +440,19 @@ Devuelve este JSON exacto:
 }}"""
     )
 
-    seo = validar_listing_antes_de_publicar(seo, producto)
-    cat_id = detectar_categoria_ebay_es(seo.get("query_categoria", "hogar gadget"))
+    seo = normalizar_seo_listing(seo_raw, producto, texto_limpio)
+    print(f"📝 [Agente 3] Título SEO generado: {seo['titulo']}")
+
+    cat_id = detectar_categoria_ebay_es(seo["query_categoria"])
     fotos_xml = "".join([f"<PictureURL>{url}</PictureURL>" for url in producto["fotos"]])
-    titulo_xml = seo["titulo"].replace("&", "y").replace("<", "").replace(">", "")
+    titulo_xml = limpiar_xml(seo["titulo"])
 
     specifics_xml = ""
-    for k, v in seo.get("specifics", {}).items():
-        val_limpio = str(v).replace("&", "y")
-        specifics_xml += f"<NameValueList><Name>{k}</Name><Value>{val_limpio}</Value></NameValueList>"
+    for k, v in seo["specifics"].items():
+        k_limpio = limpiar_xml(k)
+        val_limpio = limpiar_xml(v)
+        if k_limpio and val_limpio:
+            specifics_xml += f"<NameValueList><Name>{k_limpio}</Name><Value>{val_limpio}</Value></NameValueList>"
     specifics_xml += "<NameValueList><Name>MPN</Name><Value>No aplicable</Value></NameValueList>"
     specifics_xml += "<NameValueList><Name>EAN</Name><Value>No aplicable</Value></NameValueList>"
 
@@ -445,6 +509,7 @@ Devuelve este JSON exacto:
     res = ebay_xml_call("AddFixedPriceItem", xml)
     match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
     if match_id:
+        print(f"🎉 [Agente 3] ¡PUBLICADO EN EBAY! ItemID: {match_id.group(1)}")
         return seo, match_id.group(1), cat_id, None
     else:
         errores = re.findall(r"<LongMessage>(.*?)</LongMessage>", res)
@@ -514,7 +579,7 @@ def agente_5_atencion_clientes():
             <AddMemberMessageRTQRequest xmlns="urn:ebay:apis:eBLBaseComponents">
               <ItemID>{item_id}</ItemID>
               <MemberMessage>
-                <Body>{borrador}</Body>
+                <Body>{limpiar_xml(borrador)}</Body>
                 <ParentMessageID>{msg_id}</ParentMessageID>
                 <RecipientID>{sender}</RecipientID>
               </MemberMessage>
