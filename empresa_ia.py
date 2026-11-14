@@ -23,12 +23,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 EBAY_APP_ID = os.environ.get("EBAY_APP_ID", "").strip()
 EBAY_CERT_ID = os.environ.get("EBAY_CERT_ID", "").strip()
-RAW_REFRESH = os.environ.get("EBAY_REFRESH_TOKEN", "").strip()
-if RAW_REFRESH.count("v^1.1#") > 1:
-    EBAY_REFRESH_TOKEN = "v^1.1#" + RAW_REFRESH.split("v^1.1#")[1].strip()
-else:
-    EBAY_REFRESH_TOKEN = RAW_REFRESH
-
+EBAY_REFRESH_TOKEN = os.environ.get("EBAY_REFRESH_TOKEN", "").strip()
 EBAY_STATIC_TOKEN = os.environ.get("EBAY_TOKEN", "").strip()
 
 PINTEREST_TOKEN = os.environ.get("PINTEREST_TOKEN", "").strip()
@@ -43,11 +38,20 @@ EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 def verificar_formato_secretos():
     print(f"🔎 [Diagnóstico] EBAY_APP_ID len={len(EBAY_APP_ID)} | inicio={EBAY_APP_ID[:12]}...")
     print(f"🔎 [Diagnóstico] EBAY_CERT_ID len={len(EBAY_CERT_ID)} | inicio={EBAY_CERT_ID[:8]}...fin={EBAY_CERT_ID[-4:]}")
-    print(f"🔎 [Diagnóstico] EBAY_REFRESH_TOKEN len={len(EBAY_REFRESH_TOKEN)} | inicio={EBAY_REFRESH_TOKEN[:10]}...fin={EBAY_REFRESH_TOKEN[-6:]}")
+    print(f"🔎 [Diagnóstico] EBAY_REFRESH_TOKEN len={len(EBAY_REFRESH_TOKEN)} | inicio={EBAY_REFRESH_TOKEN[:16]}...fin={EBAY_REFRESH_TOKEN[-6:]}")
 
 def obtener_token_ebay_vivo():
     verificar_formato_secretos()
-    if EBAY_APP_ID and EBAY_CERT_ID and EBAY_REFRESH_TOKEN:
+    if not EBAY_REFRESH_TOKEN:
+        return EBAY_STATIC_TOKEN
+
+    # Si es un User Access Token directo (#f^0#r^0# o >2200 caracteres), se usa directamente
+    if "#f^0#r^0#" in EBAY_REFRESH_TOKEN or len(EBAY_REFRESH_TOKEN) > 2200:
+        print("🔑 [Seguridad] Detectado User Access Token directo de eBay. Conectando...")
+        return EBAY_REFRESH_TOKEN
+
+    # Si es el Refresh Token de 18 meses (#r^0#p^3#), se renueva automáticamente
+    if EBAY_APP_ID and EBAY_CERT_ID:
         credenciales = f"{EBAY_APP_ID}:{EBAY_CERT_ID}"
         b64_auth = base64.b64encode(credenciales.encode("utf-8")).decode("utf-8")
         headers = {
@@ -60,7 +64,7 @@ def obtener_token_ebay_vivo():
         }
         res = requests.post(EBAY_OAUTH_URL, headers=headers, data=data, timeout=15)
         if res.status_code == 200:
-            print("🔑 [Seguridad] Token de eBay renovado automáticamente con éxito.")
+            print("🔑 [Seguridad] Token de eBay renovado automáticamente con éxito (18 meses activo).")
             return res.json().get("access_token")
         else:
             print(f"⚠️ Error renovando token eBay ({res.status_code}): {res.text}")
@@ -443,8 +447,8 @@ Devuelve este JSON exacto:
     if match_id:
         return seo, match_id.group(1), cat_id, None
     else:
-        err_match = re.search(r"<LongMessage>(.*?)</LongMessage>", res)
-        err_msg = err_match.group(1) if err_match else res[:400]
+        errores = re.findall(r"<LongMessage>(.*?)</LongMessage>", res)
+        err_msg = " | ".join(errores) if errores else res[:500]
         print(f"⚠️ eBay devolvió aviso/error: {err_msg}")
         return seo, "ERROR_EBAY", cat_id, err_msg
 
