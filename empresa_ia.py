@@ -126,6 +126,7 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
     payload = {
         "model": GROQ_MODEL_ACTIVO,
         "temperature": 0.2,
+        "max_tokens": 2048,
         "messages": [
             {"role": "system", "content": system_prompt + instruccion_extra},
             {"role": "user", "content": user_prompt}
@@ -138,6 +139,8 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
         return {} if json_mode else ""
 
     contenido = res["choices"][0]["message"]["content"].strip()
+    contenido = re.sub(r"<think>.*?</think>", "", contenido, flags=re.DOTALL).strip()
+
     if not json_mode:
         return contenido
 
@@ -151,7 +154,7 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
                 return json.loads(match.group(0))
             except Exception:
                 pass
-        print(f"⚠️ No se pudo parsear JSON de Groq, usando respaldo automático.")
+        print("⚠️ No se pudo parsear JSON de Groq, usando respaldo automático.")
         return {}
 
 def limpiar_xml(texto):
@@ -405,14 +408,66 @@ def agente_2_diseno_multimedia(producto):
 # ==============================================================================
 # AGENTE 3 (TIENDA MULTI-PAÍS): Publica para España + Alemania + Francia + Italia
 # ==============================================================================
-def detectar_categoria_ebay_es(query_es):
-    xml = f"""<?xml version="1.0" encoding="utf-8"?>
-    <GetSuggestedCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-      <Query>{limpiar_xml(query_es)}</Query>
-    </GetSuggestedCategoriesRequest>"""
-    res = ebay_xml_call("GetSuggestedCategories", xml)
-    match = re.search(r"<CategoryID>(\d+)</CategoryID>", res)
-    return match.group(1) if match else "172008"
+def detectar_categoria_ebay_es(query_es, titulo_es=""):
+    palabras_titulo = [w for w in re.findall(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]{4,}", titulo_es) if w.lower() not in {"para", "con", "envio", "gratis", "pack", "piezas"}]
+    candidatos_query = [query_es] + palabras_titulo[:3] + ["lampara led", "juguete educativo", "organizador cocina", "accesorios hogar"]
+
+    for q in candidatos_query:
+        q_limpia = limpiar_xml(q)
+        if not q_limpia:
+            continue
+        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+        <GetSuggestedCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+          <Query>{q_limpia}</Query>
+        </GetSuggestedCategoriesRequest>"""
+        res = ebay_xml_call("GetSuggestedCategories", xml)
+        try:
+            root = ET.fromstring(res)
+            ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
+            cat_el = root.find(".//eb:SuggestedCategory/eb:Category/eb:CategoryID", ns)
+            if cat_el is not None and cat_el.text:
+                cat_name_el = root.find(".//eb:SuggestedCategory/eb:Category/eb:CategoryName", ns)
+                nombre_cat = cat_name_el.text if cat_name_el is not None else ""
+                print(f"📂 [Agente 3] Categoría hoja seleccionada en eBay ES: {cat_el.text} ({nombre_cat}) [query='{q_limpia}']")
+                return cat_el.text
+        except Exception:
+            pass
+
+    return "11700"
+
+def obtener_politicas_vendedor_ebay():
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+    <GetUserPreferencesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+      <ShowSellerProfilePreferences>true</ShowSellerProfilePreferences>
+    </GetUserPreferencesRequest>"""
+    res_xml = ebay_xml_call("GetUserPreferences", xml)
+    perfiles = {"opted_in": False, "shipping": None, "return": None, "payment": None}
+
+    try:
+        root = ET.fromstring(res_xml)
+        ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
+        opted = root.find(".//eb:SellerProfilePreferences/eb:SellerProfileOptedIn", ns)
+        if opted is not None and opted.text == "true":
+            perfiles["opted_in"] = True
+
+        for prof in root.findall(".//eb:SupportedSellerProfile", ns):
+            ptype = prof.find("eb:ProfileType", ns)
+            pid = prof.find("eb:ProfileID", ns)
+            if ptype is None or pid is None:
+                continue
+            if ptype.text == "SHIPPING" and not perfiles["shipping"]:
+                perfiles["shipping"] = pid.text
+            elif ptype.text == "RETURN_POLICY" and not perfiles["return"]:
+                perfiles["return"] = pid.text
+            elif ptype.text == "PAYMENT" and not perfiles["payment"]:
+                perfiles["payment"] = pid.text
+
+        if perfiles["opted_in"]:
+            print(f"📋 [Agente 3] Políticas comerciales de eBay detectadas: Envío={perfiles['shipping']} | Devolución={perfiles['return']} | Pago={perfiles['payment']}")
+    except Exception as e:
+        print(f"Aviso leyendo políticas del vendedor: {e}")
+
+    return perfiles
 
 def obtener_servicios_envio_ebay_es():
     xml = """<?xml version="1.0" encoding="utf-8"?>
@@ -438,28 +493,21 @@ def obtener_servicios_envio_ebay_es():
                 internacionales.append(code)
             else:
                 nacionales.append(code)
-    except Exception as e:
-        print(f"Aviso leyendo servicios de envío eBay: {e}")
+    except Exception:
+        pass
 
-    nac_elegido = "ES_CartasCertificadas"
+    nac_elegido = nacionales[0] if nacionales else "ES_CartasCertificadas"
     for cand in ["ES_EstandarDesdeElExtranjero", "ES_CartasCertificadas", "ES_PaqueteAzul", "ES_EnvioUrgente"]:
         if cand in nacionales:
             nac_elegido = cand
             break
-    else:
-        if nacionales:
-            nac_elegido = nacionales[0]
 
-    intl_elegido = "ES_StandardInternational"
+    intl_elegido = internacionales[0] if internacionales else "ES_StandardInternational"
     for cand in ["ES_StandardInternational", "ES_EconomyInternational", "ES_TrackedInternational"]:
         if cand in internacionales:
             intl_elegido = cand
             break
-    else:
-        if internacionales:
-            intl_elegido = internacionales[0]
 
-    print(f"🚚 [Agente 3] Servicios de envío verificados en eBay ES: Nacional={nac_elegido} | UE={intl_elegido}")
     return nac_elegido, intl_elegido
 
 def normalizar_seo_listing(seo_raw, producto, texto_limpio):
@@ -489,7 +537,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
     query_cat = (
         seo_raw.get("query_categoria")
         or seo_raw.get("category_query")
-        or "hogar gadget"
+        or "iluminacion hogar"
     )
 
     specifics = seo_raw.get("specifics")
@@ -508,12 +556,22 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         "specifics": specifics
     }
 
-def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, incluir_politicas=True, nac_srv="ES_CartasCertificadas", intl_srv="ES_StandardInternational"):
+def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles_vendedor=None, nac_srv="ES_CartasCertificadas", intl_srv="ES_StandardInternational"):
     titulo_xml = limpiar_xml(seo["titulo"])
     pais_almacen = producto.get("almacen", "DE")
 
     bloque_politicas = ""
-    if incluir_politicas:
+    if perfiles_vendedor and perfiles_vendedor.get("opted_in"):
+        partes_perfil = []
+        if perfiles_vendedor.get("shipping"):
+            partes_perfil.append(f"<SellerShippingProfile><ShippingProfileID>{perfiles_vendedor['shipping']}</ShippingProfileID></SellerShippingProfile>")
+        if perfiles_vendedor.get("return"):
+            partes_perfil.append(f"<SellerReturnProfile><ReturnProfileID>{perfiles_vendedor['return']}</ReturnProfileID></SellerReturnProfile>")
+        if perfiles_vendedor.get("payment"):
+            partes_perfil.append(f"<SellerPaymentProfile><PaymentProfileID>{perfiles_vendedor['payment']}</PaymentProfileID></SellerPaymentProfile>")
+        if partes_perfil:
+            bloque_politicas = f"<SellerProfiles>{''.join(partes_perfil)}</SellerProfiles>"
+    elif perfiles_vendedor is not None:
         bloque_politicas = f"""
         <ReturnPolicy>
           <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
@@ -595,7 +653,7 @@ Devuelve este JSON exacto:
     seo = normalizar_seo_listing(seo_raw, producto, texto_limpio)
     print(f"📝 [Agente 3] Título SEO generado: {seo['titulo']}")
 
-    cat_id = detectar_categoria_ebay_es(seo["query_categoria"])
+    cat_id = detectar_categoria_ebay_es(seo["query_categoria"], seo["titulo"])
     fotos_xml = "".join([f"<PictureURL>{url}</PictureURL>" for url in producto["fotos"]])
 
     specifics_xml = ""
@@ -607,8 +665,10 @@ Devuelve este JSON exacto:
     specifics_xml += "<NameValueList><Name>MPN</Name><Value>No aplicable</Value></NameValueList>"
     specifics_xml += "<NameValueList><Name>EAN</Name><Value>No aplicable</Value></NameValueList>"
 
-    nac_srv, intl_srv = obtener_servicios_envio_ebay_es()
-    xml = construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, True, nac_srv, intl_srv)
+    perfiles = obtener_politicas_vendedor_ebay()
+    nac_srv, intl_srv = ("", "") if perfiles.get("opted_in") else obtener_servicios_envio_ebay_es()
+
+    xml = construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles, nac_srv, intl_srv)
     res = ebay_xml_call("AddFixedPriceItem", xml)
 
     match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
@@ -616,11 +676,10 @@ Devuelve este JSON exacto:
         print(f"🎉 [Agente 3] ¡PUBLICADO EN EBAY! ItemID: {match_id.group(1)}")
         return seo, match_id.group(1), cat_id, None
 
-    # Si eBay tiene perfiles comerciales activos en la cuenta, reintenta usando los perfiles por defecto
-    if "SellerProfiles" in res or "Business Policies" in res or "perfiles" in res.lower():
-        print("🔄 [Agente 3] Detectados Perfiles Comerciales en eBay, aplicando políticas de la cuenta...")
-        xml_perfiles = construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, False)
-        res = ebay_xml_call("AddFixedPriceItem", xml_perfiles)
+    if any(w in res.lower() for w in ["sellerprofiles", "business policies", "perfiles", "políticas del vendedor", "identificadores de las políticas"]):
+        print("🔄 [Agente 3] Reintentando publicación dejando que eBay aplique sus políticas por defecto...")
+        xml_sin_politicas = construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, None)
+        res = ebay_xml_call("AddFixedPriceItem", xml_sin_politicas)
         match_id = re.search(r"<ItemID>(\d+)</ItemID>", res)
         if match_id:
             print(f"🎉 [Agente 3] ¡PUBLICADO EN EBAY! ItemID: {match_id.group(1)}")
