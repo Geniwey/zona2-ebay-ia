@@ -89,8 +89,8 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "openai/gpt-oss-120b",
-        "temperature": 0.15,
+        "model": "llama-3.3-70b-versatile",
+        "temperature": 0.2,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -98,10 +98,18 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
+
     res = requests.post(url, headers=headers, json=payload, timeout=30).json()
+
+    # Reintento automático sin restricción estricta de JSON si Groq devuelve error de formato
+    if "choices" not in res and json_mode:
+        payload.pop("response_format", None)
+        res = requests.post(url, headers=headers, json=payload, timeout=30).json()
+
     if "choices" not in res:
         print(f"⚠️ Respuesta inesperada de Groq: {res}")
         return {} if json_mode else ""
+
     contenido = res["choices"][0]["message"]["content"].strip()
     if not json_mode:
         return contenido
@@ -229,7 +237,7 @@ def agente_1_cazar_tendencia(skus_excluidos):
     contexto_tendencias = titulos_amz if titulos_amz else ["LED ambient lamps", "kitchen organizers", "portable massagers", "smart home gadgets"]
 
     kw_json = llamar_groq(
-        "Eres un analista de producto de dropshipping europeo. Devuelve únicamente JSON válido.",
+        "Eres un analista de producto de dropshipping europeo. Devuelve únicamente un objeto JSON válido.",
         f"Tendencias detectadas hoy: {contexto_tendencias}. Devuelve un JSON con una lista 'keywords' de 5 palabras clave cortas en inglés (1 o 2 palabras cada una) de productos genéricos de alta demanda para buscar en almacén europeo. Ejemplo: {{\"keywords\": [\"lamp\", \"projector\", \"massager\", \"kitchen\", \"led\"]}}"
     )
 
@@ -307,7 +315,7 @@ def agente_1_cazar_tendencia(skus_excluidos):
 def agente_2_diseno_multimedia(producto):
     print("🎨 [Agente 2 - Diseño] Creando 10 anuncios + Vídeo Vertical MP4 + Lote CSV para Canva Pro...")
     disenos = llamar_groq(
-        "Eres un director creativo de e-commerce en Europa. Responde solo con JSON válido.",
+        "Eres un director creativo de e-commerce en Europa. Responde solo con un objeto JSON válido.",
         f"Producto: {producto['titulo_en']}. Precio: {producto['precio_venta']}€. Genera un JSON con una lista 'variantes' de exactamente 10 versiones de anuncio. Cada ítem debe tener: 'id' (1 a 10), 'gancho' (máx 4 palabras impactantes en español), 'angulo' (frase persuasiva para TikTok/Pinterest) y 'color_hex' (color oscuro elegante ej: #0F172A, #1E3A8A, #065F46, #7C2D12)."
     )
 
@@ -419,21 +427,22 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
 
 def agente_3_publicar_tienda_europa(producto, variantes):
     print("🛒 [Agente 3 - Tienda UE] Publicando en eBay con alcance a toda la Unión Europea...")
-    texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:1500]
+    texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:900]
 
     seo_raw = llamar_groq(
-        "Eres un experto en SEO para eBay Europa. Prohibido usar marcas registradas, URLs, emails o teléfonos. Devuelve únicamente JSON válido.",
-        f"""Nombre original: {producto['titulo_en']}
+        "Eres un experto en SEO para eBay Europa. Devuelve únicamente JSON válido sin comillas sin escapar dentro de los valores.",
+        f"""Traduce y optimiza este producto para eBay España.
+Producto: {producto['titulo_en']}
 Detalles: {texto_limpio}
 
-Devuelve este JSON exacto con estas claves en español:
+Devuelve este JSON exacto:
 {{
-  "query_categoria": "2 palabras en español del objeto (ej: bloques magneticos)",
-  "titulo": "Título SEO en español de 70 a 80 caracteres con keyword principal al inicio",
-  "descripcion_html": "<div><h2>Calidad Premium - Stock en Europa</h2><p>Descripción persuasiva...</p><ul><li>Beneficio 1</li><li>Beneficio 2</li><li>Envío rápido desde almacén europeo a toda la UE en 3-7 días laborables.</li></ul></div>",
+  "query_categoria": "2 palabras en español del objeto",
+  "titulo": "Título SEO en español de 65 a 78 caracteres",
+  "descripcion_html": "<div><h2>Calidad Premium - Envío Rápido Europa</h2><p>Descripción comercial en español.</p><ul><li>Envío rápido desde almacén europeo en 3-7 días.</li><li>Garantía europea de 14 días.</li></ul></div>",
   "specifics": {{
     "Marca": "Genérico",
-    "Tipo": "Especificar tipo",
+    "Tipo": "Accesorio",
     "Color": "Multicolor",
     "Material": "Alta resistencia"
   }}
@@ -491,7 +500,7 @@ Devuelve este JSON exacto con estas claves en español:
         <ShippingDetails>
           <ShippingServiceOptions>
             <ShippingServicePriority>1</ShippingServicePriority>
-            <ShippingService>ES_StandardInternational</ShippingService>
+            <ShippingService>ES_OtrosEnvios</ShippingService>
             <FreeShipping>true</FreeShipping>
           </ShippingServiceOptions>
           <InternationalShippingServiceOption>
