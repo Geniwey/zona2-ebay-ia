@@ -34,9 +34,15 @@ PINTEREST_BOARD_ID = os.environ.get("PINTEREST_BOARD_ID", "").strip()
 EBAY_XML_URL = "https://api.ebay.com/ws/api.dll"
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 
-# Parámetros de precios orientados a máxima velocidad de venta (cuentas nuevas)
-ENVIO_CJ_ESTIMADO_UE = 2.50     # Colchón para envío desde almacén europeo CJ
-BENEFICIO_MINIMO_OBJETIVO = 2.80  # Beneficio limpio mínimo garantizado por venta
+# Blindaje financiero: incluye inserción eBay (0.42€) + colchón Ads 2.5% + envío real
+TARIFA_INSERCION_EBAY = 0.42      # 0.35€ + 21% IVA (amortizada en la 1ª venta)
+TASA_PROMO_EBAY = 0.025           # Colchón para Anuncios Patrocinados Modo General al 2.5%
+COLCHON_SEGURIDAD_ENVIO = 0.60    # Margen extra ante variaciones de tarifa postal
+ENVIO_RESPALDO_CONSERVADOR = 4.50 # Si CJ no devuelve tarifa exacta, asume 4.50€
+BENEFICIO_MINIMO_OBJETIVO = 3.00  # Beneficio limpio mínimo garantizado desde la 1ª venta
+PRECIO_MAXIMO_ROTACION = 29.95    # Tope de PVP para alta conversión y rápida rotación
+STOCK_POR_ANUNCIO = 3             # 3 unidades por anuncio para amortizar la tarifa de 0.42€
+DIAS_PODA_SIN_VENTAS = 27         # Retira antes del día 30 para evitar cuota de renovación
 
 # Palabras bloqueadas por seguridad UE / políticas de cuentas nuevas en eBay
 PALABRAS_PROHIBIDAS_UE = {
@@ -240,37 +246,77 @@ def enviar_telegram(texto, botones=None):
         payload["reply_markup"] = {"inline_keyboard": botones}
     requests.post(url, json=payload, timeout=15)
 
-def calcular_economia_penetracion(coste_cj):
-    """Calcula precio competitivo (.95 €) garantizando beneficio limpio real tras envío CJ y comisión eBay + IVA."""
-    coste_total_cj = round(coste_cj + ENVIO_CJ_ESTIMADO_UE, 2)
-    tasa_ebay = 0.115 * 1.21   # 11.5% tarifa eBay + 21% IVA
-    fijo_ebay = 0.35 * 1.21    # 0.35€ fijo eBay + 21% IVA
+def consultar_envio_real_cj(vid, origen_ue, destino_ue="ES"):
+    """Consulta la tarifa logística real en CJ Dropshipping para no perder dinero nunca."""
+    if not vid:
+        return None, None
+    try:
+        time.sleep(1.1)
+        url = "https://developers.cjdropshipping.com/api2.0/v1/logistic/freightCalculate"
+        headers = {"CJ-Access-Token": CJ_ACCESS_TOKEN, "Content-Type": "application/json"}
+        payload = {
+            "startCountryCode": origen_ue,
+            "endCountryCode": destino_ue,
+            "products": [{"quantity": 1, "vid": vid}]
+        }
+        res = requests.post(url, headers=headers, json=payload, timeout=15).json()
+        opciones = res.get("data") or []
+        if res.get("result") and isinstance(opciones, list) and opciones:
+            validas = []
+            for op in opciones:
+                try:
+                    precio = float(op.get("logisticPrice", 0))
+                    nombre = str(op.get("logisticName", "Standard"))
+                    if precio > 0:
+                        validas.append((precio, nombre))
+                except (ValueError, TypeError):
+                    continue
+            if validas:
+                validas.sort(key=lambda x: x[0])
+                return validas[0][0], validas[0][1]
+    except Exception as e:
+        print(f"⚠️ Aviso consultando envío real CJ ({origen_ue}->{destino_ue}): {e}")
+    return None, None
 
-    precio_bruto = (coste_total_cj + fijo_ebay + BENEFICIO_MINIMO_OBJETIVO) / (1.0 - tasa_ebay)
+def calcular_economia_blindada(coste_prod_real, envio_real_ue):
+    """Fija precio .95€ amortizando tarifa inserción (0.42€) + Ads 2.5% + envío real desde la 1ª venta."""
+    envio_asegurado = round(envio_real_ue + COLCHON_SEGURIDAD_ENVIO, 2)
+    coste_total_cj = round(coste_prod_real + envio_asegurado, 2)
+    tasa_total_ebay = (0.115 + TASA_PROMO_EBAY) * 1.21
+    fijo_ebay = 0.35 * 1.21
+
+    precio_bruto = (coste_total_cj + fijo_ebay + TARIFA_INSERCION_EBAY + BENEFICIO_MINIMO_OBJETIVO) / (1.0 - tasa_total_ebay)
     precio_psicologico = math.floor(precio_bruto) + 0.95
-    if precio_psicologico < precio_bruto - 0.15:
+    if precio_psicologico < precio_bruto - 0.10:
         precio_psicologico += 1.00
 
     precio_venta = round(precio_psicologico, 2)
     comision_ebay = round((precio_venta * 0.115 + 0.35) * 1.21, 2)
-    beneficio_neto = round(precio_venta - comision_ebay - coste_total_cj, 2)
+    coste_promo = round((precio_venta * TASA_PROMO_EBAY) * 1.21, 2)
 
-    # Suelo para Mejor Oferta automática (deja al menos 2.00€ limpios)
-    oferta_minima = round(max(precio_venta - 1.50, coste_total_cj + comision_ebay + 2.00), 2)
+    beneficio_neto_1a = round(precio_venta - comision_ebay - coste_promo - coste_total_cj - TARIFA_INSERCION_EBAY, 2)
+    beneficio_neto_siguientes = round(precio_venta - comision_ebay - coste_promo - coste_total_cj, 2)
+
+    # Suelo para Mejor Oferta automática (deja al menos +2.20€ limpios tras amortizar inserción)
+    oferta_minima = round(max(precio_venta - 1.50, coste_total_cj + comision_ebay + coste_promo + TARIFA_INSERCION_EBAY + 2.20), 2)
     oferta_autoaceptar = round(max(precio_venta - 0.80, oferta_minima + 0.30), 2)
 
     return {
-        "coste_cj": round(coste_cj, 2),
+        "coste_cj": round(coste_prod_real, 2),
+        "envio_real_ue": round(envio_real_ue, 2),
+        "envio_asegurado": envio_asegurado,
         "coste_total_cj": coste_total_cj,
         "precio_venta": precio_venta,
         "comision_ebay": comision_ebay,
-        "beneficio_neto": beneficio_neto,
+        "coste_promo": coste_promo,
+        "beneficio_neto": beneficio_neto_1a,
+        "beneficio_siguientes": beneficio_neto_siguientes,
         "oferta_minima": oferta_minima,
         "oferta_autoaceptar": oferta_autoaceptar
     }
 
 # ==============================================================================
-# AGENTE 6 (DATOS Y PODADOR): Audita catálogo activo y retira muertos a 14 días
+# AGENTE 6 (DATOS Y PODADOR): Audita catálogo y retira muertos antes del día 30
 # ==============================================================================
 def agente_6_datos_podar_catalogo():
     print("📊 [Agente 6 - Datos] Auditando catálogo activo en eBay...")
@@ -314,7 +360,8 @@ def agente_6_datos_podar_catalogo():
             if vendidos > 0:
                 ganadores.append(f"{titulo_item[:28]}... ({vendidos} v.)")
 
-            if dias >= 14 and vendidos == 0:
+            # Se retira al día 27 si tiene 0 ventas para NO pagar la renovación del día 30 (+0.42€)
+            if dias >= DIAS_PODA_SIN_VENTAS and vendidos == 0:
                 end_xml = f"""<?xml version="1.0" encoding="utf-8"?>
                 <EndFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
                   <ItemID>{item_id}</ItemID>
@@ -322,21 +369,231 @@ def agente_6_datos_podar_catalogo():
                 </EndFixedPriceItemRequest>"""
                 ebay_xml_call("EndFixedPriceItem", end_xml)
                 eliminados += 1
-                print(f"✂️ [Agente 6] Retirado anuncio sin ventas tras {dias} días: {titulo_item[:40]}")
+                print(f"✂️ [Agente 6] Retirado antes de renovación ({dias} días, 0 ventas): {titulo_item[:40]}")
     except Exception as e:
         print(f"Aviso en lectura de catálogo activo: {e}")
 
     return skus_activos, eliminados, ganadores
 
 # ==============================================================================
-# AGENTE 1 (TENDENCIAS): Escanea CJ Almacenes UE con Filtro Seguro UE
+# AGENTE 4 (PEDIDOS + PAGO CJ WALLET + TRACKING): Automatiza compras y envíos
+# ==============================================================================
+def obtener_detalle_variante_cj(pid):
+    time.sleep(1.1)
+    url = f"https://developers.cjdropshipping.com/api2.0/v1/product/query?pid={pid}"
+    res = requests.get(url, headers={"CJ-Access-Token": CJ_ACCESS_TOKEN}, timeout=15).json()
+    data = res.get("data") or {}
+    variantes = data.get("variants") or []
+    vid_elegido = None
+    precio_max = 0.0
+
+    for v in variantes:
+        try:
+            p = float(str(v.get("variantSellPrice", "0")).split("-")[0].strip())
+            if p >= precio_max:
+                precio_max = p
+                vid_elegido = v.get("vid")
+        except ValueError:
+            continue
+
+    if not vid_elegido and variantes:
+        vid_elegido = variantes[0].get("vid")
+    if precio_max <= 0:
+        try:
+            precio_max = float(str(data.get("sellPrice", "0")).split("-")[0].strip())
+        except ValueError:
+            precio_max = 0.0
+
+    return data, vid_elegido, precio_max
+
+def agente_4_pedidos_y_tracking_automatico():
+    print("🚚 [Agente 4 - Pedidos y Tracking] Comprobando ventas pendientes en eBay...")
+    if not EBAY_ACTIVE_TOKEN or not CJ_ACCESS_TOKEN:
+        return 0, 0
+
+    ahora = datetime.datetime.now(datetime.timezone.utc)
+    desde = (ahora - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    hasta = ahora.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    xml_orders = f"""<?xml version="1.0" encoding="utf-8"?>
+    <GetOrdersRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+      <CreateTimeFrom>{desde}</CreateTimeFrom>
+      <CreateTimeTo>{hasta}</CreateTimeTo>
+      <OrderRole>Seller</OrderRole>
+      <OrderStatus>Completed</OrderStatus>
+    </GetOrdersRequest>"""
+
+    res_xml = ebay_xml_call("GetOrders", xml_orders)
+    pedidos_tramitados = 0
+    trackings_subidos = 0
+
+    try:
+        root = ET.fromstring(res_xml)
+        ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
+        headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN, "Content-Type": "application/json"}
+
+        for order in root.findall(".//eb:Order", ns):
+            order_id = order.findtext("eb:OrderID", default="", namespaces=ns)
+            paid_time = order.findtext("eb:PaidTime", default="", namespaces=ns)
+            shipped_time = order.findtext("eb:ShippedTime", default="", namespaces=ns)
+            total_pagado = float(order.findtext("eb:AmountPaid", default="0", namespaces=ns) or 0)
+
+            if not order_id or not paid_time or shipped_time:
+                continue
+
+            tx = order.find(".//eb:Transaction", ns)
+            if tx is None:
+                continue
+
+            sku_pid = tx.findtext("eb:Item/eb:SKU", default="", namespaces=ns).strip()
+            item_id = tx.findtext("eb:Item/eb:ItemID", default="", namespaces=ns).strip()
+            tx_id = tx.findtext("eb:TransactionID", default="", namespaces=ns).strip()
+            cantidad = int(tx.findtext("eb:QuantityPurchased", default="1", namespaces=ns) or 1)
+            origen_almacen = tx.findtext("eb:Item/eb:Country", default="DE", namespaces=ns).strip() or "DE"
+
+            if not sku_pid:
+                continue
+
+            time.sleep(1.1)
+            det_cj = requests.get(
+                f"https://developers.cjdropshipping.com/api2.0/v1/shopping/order/getOrderDetail?orderId={requests.utils.quote(order_id)}",
+                headers=headers_cj,
+                timeout=15
+            ).json()
+
+            if det_cj.get("result") and det_cj.get("data"):
+                cj_data = det_cj["data"]
+                track_num = str(cj_data.get("trackNumber") or "").strip()
+                carrier = str(cj_data.get("logisticName") or "DHL").strip()
+                cj_oid = str(cj_data.get("orderId") or order_id)
+
+                if track_num:
+                    complete_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+                    <CompleteSaleRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+                      <ItemID>{item_id}</ItemID>
+                      <TransactionID>{tx_id}</TransactionID>
+                      <OrderID>{order_id}</OrderID>
+                      <Shipped>true</Shipped>
+                      <Shipment>
+                        <ShipmentTrackingDetails>
+                          <ShipmentTrackingNumber>{limpiar_xml(track_num)}</ShipmentTrackingNumber>
+                          <ShippingCarrierUsed>{limpiar_xml(carrier[:30])}</ShippingCarrierUsed>
+                        </ShipmentTrackingDetails>
+                      </Shipment>
+                    </CompleteSaleRequest>"""
+                    ebay_xml_call("CompleteSale", complete_xml)
+                    trackings_subidos += 1
+                    enviar_telegram(f"📦 SEGUIMIENTO SUBIDO AUTOMÁTICAMENTE A EBAY\nPedido: {order_id}\nTracking: {track_num} ({carrier})")
+                    continue
+
+                if str(cj_data.get("orderStatus", "")).upper() in ("CREATED", "UNPAID"):
+                    pay_res = requests.post(
+                        "https://developers.cjdropshipping.com/api2.0/v1/shopping/order/payBalance",
+                        headers=headers_cj,
+                        json={"orderId": cj_oid},
+                        timeout=15
+                    ).json()
+                    if pay_res.get("result"):
+                        enviar_telegram(f"💸 PEDIDO PAGADO AUTOMÁTICAMENTE CON CJ WALLET\nPedido eBay: {order_id}\nID CJ: {cj_oid}")
+                continue
+
+            addr = order.find(".//eb:ShippingAddress", ns)
+            if addr is None:
+                continue
+
+            nombre_cliente = addr.findtext("eb:Name", default="", namespaces=ns)
+            calle1 = addr.findtext("eb:Street1", default="", namespaces=ns)
+            calle2 = addr.findtext("eb:Street2", default="", namespaces=ns)
+            ciudad = addr.findtext("eb:CityName", default="", namespaces=ns)
+            provincia = addr.findtext("eb:StateOrProvince", default="", namespaces=ns) or ciudad
+            cp = addr.findtext("eb:PostalCode", default="", namespaces=ns)
+            pais_destino = addr.findtext("eb:Country", default="ES", namespaces=ns)
+            telefono = addr.findtext("eb:Phone", default="600000000", namespaces=ns) or "600000000"
+
+            _, vid, coste_unit_real = obtener_detalle_variante_cj(sku_pid)
+            envio_real, nombre_logistica = consultar_envio_real_cj(vid, origen_almacen, pais_destino)
+            if envio_real is None:
+                envio_real = ENVIO_RESPALDO_CONSERVADOR
+                nombre_logistica = "Standard Shipping"
+
+            coste_total_cj_pedido = round((coste_unit_real * cantidad) + envio_real, 2)
+            comision_ebay_est = round((total_pagado * (0.115 + TASA_PROMO_EBAY) + 0.35) * 1.21, 2)
+            ingreso_neto_ebay = round(total_pagado - comision_ebay_est, 2)
+
+            if coste_total_cj_pedido > ingreso_neto_ebay - 1.00:
+                enviar_telegram(
+                    f"🛑 BLOQUEO ANTI-PÉRDIDAS EN PEDIDO {order_id}\n"
+                    f"Ingreso neto eBay: {ingreso_neto_ebay}€ vs Coste real CJ: {coste_total_cj_pedido}€.\n"
+                    f"Revisa este pedido manualmente antes de pagarlo."
+                )
+                continue
+
+            payload_cj = {
+                "orderNumber": order_id,
+                "shippingZip": cp,
+                "shippingCountryCode": pais_destino,
+                "shippingCountry": pais_destino,
+                "shippingProvince": provincia,
+                "shippingCity": ciudad,
+                "shippingAddress": f"{calle1} {calle2}".strip(),
+                "shippingCustomerName": nombre_cliente,
+                "shippingPhone": telefono,
+                "logisticName": nombre_logistica,
+                "fromCountryCode": origen_almacen,
+                "products": [{"vid": vid, "quantity": cantidad}]
+            }
+
+            time.sleep(1.1)
+            create_res = requests.post(
+                "https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrderV2",
+                headers=headers_cj,
+                json=payload_cj,
+                timeout=20
+            ).json()
+
+            if create_res.get("result") and create_res.get("data"):
+                cj_order_id = str(create_res["data"])
+                pedidos_tramitados += 1
+
+                time.sleep(1.1)
+                pay_res = requests.post(
+                    "https://developers.cjdropshipping.com/api2.0/v1/shopping/order/payBalance",
+                    headers=headers_cj,
+                    json={"orderId": cj_order_id},
+                    timeout=15
+                ).json()
+
+                beneficio_pedido = round(ingreso_neto_ebay - coste_total_cj_pedido, 2)
+                if pay_res.get("result"):
+                    enviar_telegram(
+                        f"🎉 VENTA TRAMITADA Y PAGADA AUTOMÁTICAMENTE\n\n"
+                        f"🧾 Pedido eBay: {order_id}\n"
+                        f"💶 Cobrado neto eBay: {ingreso_neto_ebay}€\n"
+                        f"🏭 Pagado CJ Wallet: -{coste_total_cj_pedido}€\n"
+                        f"💰 Beneficio limpio real: +{beneficio_pedido}€"
+                    )
+                else:
+                    enviar_telegram(
+                        f"🛒 NUEVA VENTA — PEDIDO YA CREADO EN CJ\n\n"
+                        f"🧾 Pedido eBay: {order_id}\n"
+                        f"👤 Cliente: {nombre_cliente} ({pais_destino})\n"
+                        f"💶 Coste CJ a pagar: {coste_total_cj_pedido}€ (Ganancia limpia: +{beneficio_pedido}€)\n"
+                        f"👉 Entra en CJ Dropshipping > Orders y pulsa Pay."
+                    )
+    except Exception as e:
+        print(f"⚠️ Aviso en Agente 4 (Pedidos): {e}")
+
+    return pedidos_tramitados, trackings_subidos
+
+# ==============================================================================
+# AGENTE 1 (TENDENCIAS): Selecciona el mejor candidato semanal en almacenes UE
 # ==============================================================================
 def es_producto_seguro_ue(titulo_en):
     palabras = set(re.findall(r"[a-z]+", str(titulo_en).lower()))
     return len(palabras.intersection(PALABRAS_PROHIBIDAS_UE)) == 0
 
 def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
-    print("🔍 [Agente 1 - Tendencias] Rastreando productos de alta rotación en almacenes de la Unión Europea...")
+    print("🔍 [Agente 1 - Tendencias] Buscando el producto más competitivo de la semana en almacenes UE...")
     headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN}
     lista_keywords = ["organizer", "lamp", "holder", "storage", "decor", "rack", "light"]
     almacenes_ue = ["DE", "FR", "ES", "PL"]
@@ -351,7 +608,7 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
             if not res_cj.get("result"):
                 print(f"⚠️ CJ ({pais} | '{kw}'): {res_cj.get('message')}")
                 if "disabled" in str(res_cj.get("message", "")).lower():
-                    raise Exception("CJ tiene la API deshabilitada: entra en CJ > Authorization > API (pestaña API) y pulsa Unfreeze/Reactivate.")
+                    raise Exception("CJ tiene la API deshabilitada: entra en CJ > Authorization > API y pulsa Unfreeze/Reactivate.")
                 continue
 
             productos_lista = (res_cj.get("data") or {}).get("list") or []
@@ -365,16 +622,13 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
 
                 precio_raw = str(prod.get("sellPrice", "0")).split("-")[0].strip()
                 try:
-                    coste_cj = float(precio_raw)
+                    coste_base = float(precio_raw)
                 except ValueError:
                     continue
 
-                if 2.5 <= coste_cj <= 15.0:
-                    eco = calcular_economia_penetracion(coste_cj)
-
-                    time.sleep(1.2)
-                    det_url = f"https://developers.cjdropshipping.com/api2.0/v1/product/query?pid={pid}"
-                    det_data = (requests.get(det_url, headers=headers_cj, timeout=15).json().get("data")) or {}
+                if 2.5 <= coste_base <= 12.5:
+                    det_data, vid, coste_variante_max = obtener_detalle_variante_cj(pid)
+                    coste_prod_real = max(coste_base, coste_variante_max)
 
                     fotos = det_data.get("productImageSet") or [prod.get("productImage")]
                     if isinstance(fotos, str):
@@ -384,30 +638,46 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
                             fotos = [prod.get("productImage")]
 
                     fotos_limpias = [f for f in fotos if isinstance(f, str) and f.startswith("http")][:12]
-                    if not fotos_limpias:
+                    if len(fotos_limpias) < 3:
+                        continue
+
+                    envio_es, _ = consultar_envio_real_cj(vid, pais, "ES")
+                    envio_fr, _ = consultar_envio_real_cj(vid, pais, "FR")
+                    tarifas_validas = [t for t in (envio_es, envio_fr) if t is not None]
+                    envio_real_ue = max(tarifas_validas) if tarifas_validas else ENVIO_RESPALDO_CONSERVADOR
+
+                    eco = calcular_economia_blindada(coste_prod_real, envio_real_ue)
+                    if eco["precio_venta"] > PRECIO_MAXIMO_ROTACION or eco["beneficio_neto"] < 2.95:
                         continue
 
                     vistos.add(pid)
-                    print(f"✅ Candidato competitivo en {pais}: {titulo_en} ({coste_cj}€ -> {eco['precio_venta']}€ | Limpio +{eco['beneficio_neto']}€)")
                     candidatos.append({
                         "sku": pid,
+                        "vid": vid,
                         "almacen": pais,
                         "titulo_en": titulo_en,
                         "descripcion_en": det_data.get("description") or titulo_en,
                         "fotos": fotos_limpias,
                         "coste_cj": eco["coste_cj"],
+                        "envio_real_ue": eco["envio_real_ue"],
+                        "envio_asegurado": eco["envio_asegurado"],
                         "coste_total_cj": eco["coste_total_cj"],
                         "precio_venta": eco["precio_venta"],
                         "comision_ebay": eco["comision_ebay"],
+                        "coste_promo": eco["coste_promo"],
                         "beneficio_neto": eco["beneficio_neto"],
+                        "beneficio_siguientes": eco["beneficio_siguientes"],
                         "oferta_minima": eco["oferta_minima"],
                         "oferta_autoaceptar": eco["oferta_autoaceptar"]
                     })
                     if len(candidatos) >= max_candidatos:
+                        # Ordenar por PVP más competitivo para maximizar conversión
+                        candidatos.sort(key=lambda x: x["precio_venta"])
                         return candidatos
 
     if not candidatos:
-        raise Exception("No se encontraron candidatos nuevos seguros hoy en los almacenes de la UE.")
+        raise Exception("No se encontraron candidatos nuevos con margen blindado hoy en la UE.")
+    candidatos.sort(key=lambda x: x["precio_venta"])
     return candidatos
 
 # ==============================================================================
@@ -637,7 +907,7 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
         <DispatchTimeMax>2</DispatchTimeMax>
         <ListingDuration>GTC</ListingDuration>
         <ListingType>FixedPriceItem</ListingType>
-        <Quantity>2</Quantity>
+        <Quantity>{STOCK_POR_ANUNCIO}</Quantity>
         <PictureDetails>{fotos_xml}</PictureDetails>
         <ItemSpecifics>{specifics_xml}</ItemSpecifics>
         <ProductListingDetails>
@@ -701,7 +971,6 @@ Devuelve este JSON exacto:
         xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles, incluir_mejor_oferta=True)
         res = ebay_xml_call("AddFixedPriceItem", xml)
 
-        # Si la subcategoría concreta no admite Mejor Oferta, reintenta al instante sin ella
         if "BestOffer" in res or "mejor oferta" in res.lower():
             xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles, incluir_mejor_oferta=False)
             res = ebay_xml_call("AddFixedPriceItem", xml)
@@ -725,7 +994,7 @@ Devuelve este JSON exacto:
 # ==============================================================================
 def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
     ebay_link = f"https://www.ebay.es/itm/{item_id}"
-    canales_activos = ["eBay ES/UE", "Mejor Oferta Auto", "Vídeo Reel MP4", "Lote Canva CSV"]
+    canales_activos = ["eBay ES + Unión Europea", "Mejor Oferta Auto", "Vídeo Reel MP4", "Lote Canva CSV"]
 
     if PINTEREST_TOKEN and PINTEREST_BOARD_ID and item_id != "ERROR_EBAY":
         url_pin = "https://api.pinterest.com/v5/pins"
@@ -795,48 +1064,61 @@ def agente_5_atencion_clientes():
 # EJECUCIÓN MAESTRA DE LOS 7 AGENTES
 # ==============================================================================
 if __name__ == "__main__":
-    print("=== ARRANCANDO ZONA 2 PRO: MODO VENTAS RÁPIDAS UE 24/7 ===")
+    print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR (1.68€/MES MÁX) ===")
+
+    # 1. Vigilancia diaria obligatoria: poda día 27 (evita renovación) + pedidos + trackings + mensajes
     skus_activos, podados, ganadores = agente_6_datos_podar_catalogo()
-    perfiles = obtener_politicas_vendedor_ebay()
-    candidatos = agente_1_cazar_candidatos_seguros(skus_activos, max_candidatos=4)
+    pedidos_nuevos, trackings_subidos = agente_4_pedidos_y_tracking_automatico()
+    agente_5_atencion_clientes()
 
-    publicado_ok = False
-    ultimo_error = ""
+    # 2. Publicar 1 único producto ganador por semana (Domingo=6) o ejecución manual
+    evento_github = os.environ.get("GITHUB_EVENT_NAME", "")
+    dia_semana = datetime.datetime.now(datetime.timezone.utc).weekday()
+    toca_publicar = (evento_github == "workflow_dispatch") or (dia_semana == 6)
 
-    for cand in candidatos:
-        seo, item_id, cat_id, error_ebay = agente_3_publicar_tienda_europa(cand, perfiles)
-        if not error_ebay and item_id != "ERROR_EBAY":
-            variantes = agente_2_diseno_multimedia(cand)
-            canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
-            agente_5_atencion_clientes()
+    if toca_publicar:
+        perfiles = obtener_politicas_vendedor_ebay()
+        candidatos = agente_1_cazar_candidatos_seguros(skus_activos, max_candidatos=5)
 
-            texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "Construyendo primeras ventas"
-            informe = (
-                f"🟢 ZONA 2 PRO — PRODUCTO PUBLICADO (MODO VENTAS)\n\n"
-                f"📦 Producto: {seo['titulo']}\n"
-                f"🏭 Almacén: {cand['almacen']} (Unión Europea)\n"
-                f"💶 PVP: {cand['precio_venta']}€ (Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
-                f"📊 Desglose real: Prod {cand['coste_cj']}€ + Envío est. {ENVIO_CJ_ESTIMADO_UE}€ + Com. eBay {cand['comision_ebay']}€\n"
-                f"💰 Limpio garantizado: +{cand['beneficio_neto']}€\n"
-                f"🌍 Activo en: {canales}\n"
-                f"✂️ Limpieza hoy: {podados} productos sin ventas retirados\n"
-                f"👑 Ganadores activos: {texto_ganadores}"
-            )
+        publicado_ok = False
+        ultimo_error = ""
+
+        for cand in candidatos:
+            seo, item_id, cat_id, error_ebay = agente_3_publicar_tienda_europa(cand, perfiles)
+            if not error_ebay and item_id != "ERROR_EBAY":
+                variantes = agente_2_diseno_multimedia(cand)
+                canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
+
+                texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "Construyendo primeras ventas"
+                informe = (
+                    f"🟢 ZONA 2 PRO — PRODUCTO SEMANAL PUBLICADO\n\n"
+                    f"📦 Producto: {seo['titulo']} ({STOCK_POR_ANUNCIO} uds.)\n"
+                    f"🏭 Almacén: {cand['almacen']} (Unión Europea)\n"
+                    f"💶 PVP: {cand['precio_venta']}€ (Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
+                    f"📊 Costes cubiertos: Prod {cand['coste_cj']}€ + Envío {cand['envio_real_ue']}€ + Com. eBay {cand['comision_ebay']}€ + Ads 2.5% {cand['coste_promo']}€ + Ins. {TARIFA_INSERCION_EBAY}€\n"
+                    f"💰 Limpio 1ª venta: +{cand['beneficio_neto']}€ | 2ª y 3ª venta: +{cand['beneficio_siguientes']}€\n"
+                    f"🌍 Activo en: {canales}\n"
+                    f"✂️ Podados hoy: {podados} | 🚚 Pedidos: {pedidos_nuevos} | 📦 Trackings: {trackings_subidos}\n"
+                    f"👑 Ganadores: {texto_ganadores}"
+                )
+                enviar_telegram(
+                    informe,
+                    botones=[[
+                        {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"}
+                    ]]
+                )
+                publicado_ok = True
+                break
+            else:
+                ultimo_error = error_ebay
+                print("⏭️ Probando siguiente producto candidato seguro...")
+
+        if not publicado_ok:
             enviar_telegram(
-                informe,
-                botones=[[
-                    {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"}
-                ]]
+                f"⚠️ AVISO DE EBAY AL PUBLICAR:\n{ultimo_error}\n\n"
+                f"El bot lo volverá a intentar automáticamente en el próximo ciclo programado."
             )
-            publicado_ok = True
-            break
-        else:
-            ultimo_error = error_ebay
-            print("⏭️ Probando siguiente producto candidato seguro...")
+    else:
+        print(f"ℹ️ Hoy (día {dia_semana}) solo toca mantenimiento de pedidos, tracking y poda (0€ gasto).")
 
-    if not publicado_ok:
-        enviar_telegram(
-            f"⚠️ AVISO DE EBAY AL PUBLICAR:\n{ultimo_error}\n\n"
-            f"El bot lo volverá a intentar automáticamente en el próximo ciclo programado."
-        )
     print("=== CICLO COMPLETADO ===")
