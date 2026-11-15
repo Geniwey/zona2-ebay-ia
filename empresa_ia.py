@@ -34,7 +34,7 @@ PINTEREST_BOARD_ID = os.environ.get("PINTEREST_BOARD_ID", "").strip()
 EBAY_XML_URL = "https://api.ebay.com/ws/api.dll"
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 
-# Blindaje financiero: incluye inserción eBay (0.42€) + colchón Ads 2.5% + envío real
+# Blindaje financiero ultraeconómico: inserción eBay (0.42€) + Ads 2.5% + envío real
 TARIFA_INSERCION_EBAY = 0.42      # 0.35€ + 21% IVA (amortizada en la 1ª venta)
 TASA_PROMO_EBAY = 0.025           # Colchón para Anuncios Patrocinados Modo General al 2.5%
 COLCHON_SEGURIDAD_ENVIO = 0.60    # Margen extra ante variaciones de tarifa postal
@@ -42,7 +42,7 @@ ENVIO_RESPALDO_CONSERVADOR = 4.50 # Si CJ no devuelve tarifa exacta, asume 4.50�
 BENEFICIO_MINIMO_OBJETIVO = 3.00  # Beneficio limpio mínimo garantizado desde la 1ª venta
 PRECIO_MAXIMO_ROTACION = 29.95    # Tope de PVP para alta conversión y rápida rotación
 STOCK_POR_ANUNCIO = 3             # 3 unidades por anuncio para amortizar la tarifa de 0.42€
-DIAS_PODA_SIN_VENTAS = 27         # Retira antes del día 30 para evitar cuota de renovación
+DIAS_PODA_SIN_VENTAS = 29         # Exprime todo el mes pagado y retira justo antes del día 30
 
 # Palabras bloqueadas por seguridad UE / políticas de cuentas nuevas en eBay
 PALABRAS_PROHIBIDAS_UE = {
@@ -297,7 +297,6 @@ def calcular_economia_blindada(coste_prod_real, envio_real_ue):
     beneficio_neto_1a = round(precio_venta - comision_ebay - coste_promo - coste_total_cj - TARIFA_INSERCION_EBAY, 2)
     beneficio_neto_siguientes = round(precio_venta - comision_ebay - coste_promo - coste_total_cj, 2)
 
-    # Suelo para Mejor Oferta automática (deja al menos +2.20€ limpios tras amortizar inserción)
     oferta_minima = round(max(precio_venta - 1.50, coste_total_cj + comision_ebay + coste_promo + TARIFA_INSERCION_EBAY + 2.20), 2)
     oferta_autoaceptar = round(max(precio_venta - 0.80, oferta_minima + 0.30), 2)
 
@@ -316,7 +315,7 @@ def calcular_economia_blindada(coste_prod_real, envio_real_ue):
     }
 
 # ==============================================================================
-# AGENTE 6 (DATOS Y PODADOR): Audita catálogo y retira muertos antes del día 30
+# AGENTE 6 (DATOS Y PODADOR): Audita catálogo y retira muertos al día 29
 # ==============================================================================
 def agente_6_datos_podar_catalogo():
     print("📊 [Agente 6 - Datos] Auditando catálogo activo en eBay...")
@@ -360,7 +359,7 @@ def agente_6_datos_podar_catalogo():
             if vendidos > 0:
                 ganadores.append(f"{titulo_item[:28]}... ({vendidos} v.)")
 
-            # Se retira al día 27 si tiene 0 ventas para NO pagar la renovación del día 30 (+0.42€)
+            # Se retira al día 29 si tiene 0 ventas para exprimir el mes entero sin pagar renovación
             if dias >= DIAS_PODA_SIN_VENTAS and vendidos == 0:
                 end_xml = f"""<?xml version="1.0" encoding="utf-8"?>
                 <EndFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
@@ -369,7 +368,7 @@ def agente_6_datos_podar_catalogo():
                 </EndFixedPriceItemRequest>"""
                 ebay_xml_call("EndFixedPriceItem", end_xml)
                 eliminados += 1
-                print(f"✂️ [Agente 6] Retirado antes de renovación ({dias} días, 0 ventas): {titulo_item[:40]}")
+                print(f"✂️ [Agente 6] Retirado tras exprimir {dias} días sin ventas: {titulo_item[:40]}")
     except Exception as e:
         print(f"Aviso en lectura de catálogo activo: {e}")
 
@@ -671,7 +670,6 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
                         "oferta_autoaceptar": eco["oferta_autoaceptar"]
                     })
                     if len(candidatos) >= max_candidatos:
-                        # Ordenar por PVP más competitivo para maximizar conversión
                         candidatos.sort(key=lambda x: x["precio_venta"])
                         return candidatos
 
@@ -1064,9 +1062,9 @@ def agente_5_atencion_clientes():
 # EJECUCIÓN MAESTRA DE LOS 7 AGENTES
 # ==============================================================================
 if __name__ == "__main__":
-    print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR (1.68€/MES MÁX) ===")
+    print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR MES COMPLETO (29 DÍAS) ===")
 
-    # 1. Vigilancia diaria obligatoria: poda día 27 (evita renovación) + pedidos + trackings + mensajes
+    # 1. Vigilancia diaria obligatoria: poda día 29 (exprime el mes sin renovar) + pedidos + trackings + mensajes
     skus_activos, podados, ganadores = agente_6_datos_podar_catalogo()
     pedidos_nuevos, trackings_subidos = agente_4_pedidos_y_tracking_automatico()
     agente_5_atencion_clientes()
@@ -1098,7 +1096,7 @@ if __name__ == "__main__":
                     f"📊 Costes cubiertos: Prod {cand['coste_cj']}€ + Envío {cand['envio_real_ue']}€ + Com. eBay {cand['comision_ebay']}€ + Ads 2.5% {cand['coste_promo']}€ + Ins. {TARIFA_INSERCION_EBAY}€\n"
                     f"💰 Limpio 1ª venta: +{cand['beneficio_neto']}€ | 2ª y 3ª venta: +{cand['beneficio_siguientes']}€\n"
                     f"🌍 Activo en: {canales}\n"
-                    f"✂️ Podados hoy: {podados} | 🚚 Pedidos: {pedidos_nuevos} | 📦 Trackings: {trackings_subidos}\n"
+                    f"✂️ Podados hoy (29d): {podados} | 🚚 Pedidos: {pedidos_nuevos} | 📦 Trackings: {trackings_subidos}\n"
                     f"👑 Ganadores: {texto_ganadores}"
                 )
                 enviar_telegram(
