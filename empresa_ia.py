@@ -5,6 +5,7 @@ import html
 import json
 import math
 import time
+import random
 import base64
 import datetime
 import requests
@@ -14,6 +15,11 @@ import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw
 from io import BytesIO
+
+# ==============================================================================
+# INTERRUPTOR MAESTRO DE PAUSA (CAMBIAR A False EL 22 DE DICIEMBRE PARA REACTIVAR)
+# ==============================================================================
+PAUSAR_PUBLICACIONES = True  # True = 0€ gasto, solo vigila ventas/envíos y borra al día 29
 
 # ==============================================================================
 # CONFIGURACIÓN Y CREDENCIALES DESDE GITHUB SECRETS
@@ -43,6 +49,7 @@ BENEFICIO_MINIMO_OBJETIVO = 3.00  # Beneficio limpio mínimo garantizado desde l
 PRECIO_MAXIMO_ROTACION = 29.95    # Tope de PVP para alta conversión y rápida rotación
 STOCK_POR_ANUNCIO = 3             # 3 unidades por anuncio para amortizar la tarifa de 0.42€
 DIAS_PODA_SIN_VENTAS = 29         # Exprime todo el mes pagado y retira justo antes del día 30
+ALMACENES_UE_PERMITIDOS = ["ES"]  # Solo almacén España para evitar exigencia de IVA alemán
 
 # Palabras bloqueadas por seguridad UE / políticas de cuentas nuevas en eBay
 PALABRAS_PROHIBIDAS_UE = {
@@ -321,7 +328,7 @@ def agente_6_datos_podar_catalogo():
     print("📊 [Agente 6 - Datos] Auditando catálogo activo en eBay...")
     if not EBAY_ACTIVE_TOKEN:
         print("⚠️ Sin token activo de eBay, saltando auditoría inicial.")
-        return [], 0, []
+        return [], [], 0, [], None
 
     xml = """<?xml version="1.0" encoding="utf-8"?>
     <GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
@@ -336,8 +343,11 @@ def agente_6_datos_podar_catalogo():
 
     res_xml = ebay_xml_call("GetMyeBaySelling", xml)
     skus_activos = []
+    titulos_activos = []
     eliminados = 0
+    podados_nombres = []
     ganadores = []
+    min_dias_activo = None
 
     try:
         root = ET.fromstring(res_xml)
@@ -345,16 +355,26 @@ def agente_6_datos_podar_catalogo():
         ahora = datetime.datetime.now(datetime.timezone.utc)
 
         for item in root.findall(".//eb:Item", ns):
-            item_id = item.find("eb:ItemID", ns).text
-            titulo_item = item.find("eb:Title", ns).text if item.find("eb:Title", ns) is not None else item_id
+            item_id_el = item.find("eb:ItemID", ns)
+            if item_id_el is None or not item_id_el.text:
+                continue
+            item_id = item_id_el.text.strip()
+
+            titulo_el = item.find("eb:Title", ns)
+            titulo_item = titulo_el.text.strip() if (titulo_el is not None and titulo_el.text) else item_id
+
             sku_el = item.find("eb:SKU", ns)
             if sku_el is not None and sku_el.text:
-                skus_activos.append(sku_el.text)
+                skus_activos.append(sku_el.text.strip())
 
-            start_str = item.find(".//eb:StartTime", ns).text
-            dias = (ahora - datetime.datetime.fromisoformat(start_str.replace("Z", "+00:00"))).days
+            start_el = item.find(".//eb:StartTime", ns)
+            dias = 0
+            if start_el is not None and start_el.text:
+                start_dt = datetime.datetime.fromisoformat(start_el.text.strip().replace("Z", "+00:00"))
+                dias = (ahora - start_dt).days
+
             vendidos_el = item.find(".//eb:QuantitySold", ns)
-            vendidos = int(vendidos_el.text) if vendidos_el is not None else 0
+            vendidos = int(vendidos_el.text.strip()) if (vendidos_el is not None and vendidos_el.text) else 0
 
             if vendidos > 0:
                 ganadores.append(f"{titulo_item[:28]}... ({vendidos} v.)")
@@ -368,11 +388,25 @@ def agente_6_datos_podar_catalogo():
                 </EndFixedPriceItemRequest>"""
                 ebay_xml_call("EndFixedPriceItem", end_xml)
                 eliminados += 1
-                print(f"✂️ [Agente 6] Retirado tras exprimir {dias} días sin ventas: {titulo_item[:40]}")
+                podados_nombres.append(titulo_item[:42])
+                print(f"✂️ [Agente 6] Retirado tras exprimir {dias} días sin ventas: {titulo_item[:45]}")
+            else:
+                titulos_activos.append(titulo_item.lower())
+                if min_dias_activo is None or dias < min_dias_activo:
+                    min_dias_activo = dias
+
+        if eliminados > 0:
+            lista_txt = "\n".join([f"• {n}" for n in podados_nombres])
+            enviar_telegram(
+                f"✂️ PODA AUTOMÁTICA DÍA 29 COMPLETADA\n\n"
+                f"Se han retirado {eliminados} anuncio(s) sin ventas antes de la renovación del día 30 (0,00 € coste):\n"
+                f"{lista_txt}"
+            )
     except Exception as e:
         print(f"Aviso en lectura de catálogo activo: {e}")
 
-    return skus_activos, eliminados, ganadores
+    print(f"📋 [Agente 6] Anuncios activos vigentes: {len(titulos_activos)} | Podados hoy: {eliminados}")
+    return skus_activos, titulos_activos, eliminados, ganadores, min_dias_activo
 
 # ==============================================================================
 # AGENTE 4 (PEDIDOS + PAGO CJ WALLET + TRACKING): Automatiza compras y envíos
@@ -448,7 +482,7 @@ def agente_4_pedidos_y_tracking_automatico():
             item_id = tx.findtext("eb:Item/eb:ItemID", default="", namespaces=ns).strip()
             tx_id = tx.findtext("eb:TransactionID", default="", namespaces=ns).strip()
             cantidad = int(tx.findtext("eb:QuantityPurchased", default="1", namespaces=ns) or 1)
-            origen_almacen = tx.findtext("eb:Item/eb:Country", default="DE", namespaces=ns).strip() or "DE"
+            origen_almacen = tx.findtext("eb:Item/eb:Country", default="ES", namespaces=ns).strip() or "ES"
 
             if not sku_pid:
                 continue
@@ -463,7 +497,7 @@ def agente_4_pedidos_y_tracking_automatico():
             if det_cj.get("result") and det_cj.get("data"):
                 cj_data = det_cj["data"]
                 track_num = str(cj_data.get("trackNumber") or "").strip()
-                carrier = str(cj_data.get("logisticName") or "DHL").strip()
+                carrier = str(cj_data.get("logisticName") or "Correos").strip()
                 cj_oid = str(cj_data.get("orderId") or order_id)
 
                 if track_num:
@@ -585,24 +619,24 @@ def agente_4_pedidos_y_tracking_automatico():
     return pedidos_tramitados, trackings_subidos
 
 # ==============================================================================
-# AGENTE 1 (TENDENCIAS): Selecciona el mejor candidato semanal en almacenes UE
+# AGENTE 1 (TENDENCIAS): Selecciona 1 candidato único en almacén España (ES)
 # ==============================================================================
 def es_producto_seguro_ue(titulo_en):
     palabras = set(re.findall(r"[a-z]+", str(titulo_en).lower()))
     return len(palabras.intersection(PALABRAS_PROHIBIDAS_UE)) == 0
 
-def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
-    print("🔍 [Agente 1 - Tendencias] Buscando el producto más competitivo de la semana en almacenes UE...")
+def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_candidatos=3):
+    print("🔍 [Agente 1 - Tendencias] Buscando 1 producto competitivo en almacén España (ES)...")
     headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN}
-    lista_keywords = ["organizer", "lamp", "holder", "storage", "decor", "rack", "light"]
-    almacenes_ue = ["DE", "FR", "ES", "PL"]
+    lista_keywords = ["organizer", "lamp", "holder", "storage", "decor", "rack", "kitchen", "stand"]
+    random.shuffle(lista_keywords)
     candidatos = []
     vistos = set(skus_excluidos)
 
-    for pais in almacenes_ue:
+    for pais in ALMACENES_UE_PERMITIDOS:
         for kw in lista_keywords:
             time.sleep(1.2)
-            url_cj = f"https://developers.cjdropshipping.com/api2.0/v1/product/list?countryCode={pais}&pageNum=1&pageSize=40&keyword={requests.utils.quote(kw)}"
+            url_cj = f"https://developers.cjdropshipping.com/api2.0/v1/product/list?countryCode={pais}&pageNum=1&pageSize=30&keyword={requests.utils.quote(kw)}"
             res_cj = requests.get(url_cj, headers=headers_cj, timeout=15).json()
             if not res_cj.get("result"):
                 print(f"⚠️ CJ ({pais} | '{kw}'): {res_cj.get('message')}")
@@ -614,9 +648,12 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
             print(f"📦 CJ Almacén {pais} (kw='{kw}'): {len(productos_lista)} productos encontrados.")
 
             for prod in productos_lista:
-                pid = prod.get("pid")
-                titulo_en = prod.get("productNameEn", "")
+                pid = str(prod.get("pid") or "").strip()
+                titulo_en = str(prod.get("productNameEn") or "").strip()
                 if not pid or pid in vistos or not es_producto_seguro_ue(titulo_en):
+                    continue
+
+                if any(titulo_en.lower()[:25] in t for t in titulos_excluidos):
                     continue
 
                 precio_raw = str(prod.get("sellPrice", "0")).split("-")[0].strip()
@@ -674,7 +711,7 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, max_candidatos=5):
                         return candidatos
 
     if not candidatos:
-        raise Exception("No se encontraron candidatos nuevos con margen blindado hoy en la UE.")
+        raise Exception("No se encontraron candidatos nuevos con margen blindado hoy en España.")
     candidatos.sort(key=lambda x: x["precio_venta"])
     return candidatos
 
@@ -690,7 +727,7 @@ def agente_2_diseno_multimedia(producto):
 
     os.makedirs("anuncios_generados", exist_ok=True)
     lista_variantes = disenos.get("variantes") or [
-        {"id": i + 1, "gancho": "PRECIO DIRECTO UE", "angulo": "Envío rápido desde almacén europeo", "color_hex": "#0F172A"}
+        {"id": i + 1, "gancho": "PRECIO DIRECTO ES", "angulo": "Envío rápido desde España", "color_hex": "#0F172A"}
         for i in range(10)
     ]
     lista_variantes = lista_variantes[:10]
@@ -715,7 +752,7 @@ def agente_2_diseno_multimedia(producto):
             draw.rectangle([(0, 0), (1080, 130)], fill=color_fondo)
             draw.text((40, 48), f"★ {v.get('gancho', 'TOP VENTAS').upper()} | {producto['precio_venta']}€ ★", fill="#FFFFFF")
             draw.rectangle([(0, 960), (1080, 1080)], fill="#111827")
-            draw.text((40, 1005), "ENVIO GRATIS EUROPA (3-7 DIAS) - GARANTIA 14 DIAS", fill="#10B981")
+            draw.text((40, 1005), "ENVIO DESDE ESPAÑA (3-5 DIAS) - GARANTIA 14 DIAS", fill="#10B981")
 
             ruta_jpg = f"anuncios_generados/anuncio_v{v.get('id', idx+1)}.jpg"
             lienzo_rgb = lienzo.convert("RGB")
@@ -737,7 +774,7 @@ def agente_2_diseno_multimedia(producto):
     return lista_variantes
 
 # ==============================================================================
-# AGENTE 3 (TIENDA MULTI-PAÍS): Publica en eBay España / UE con Mejor Oferta
+# AGENTE 3 (TIENDA MULTI-PAÍS): Publica en eBay España con ubicación España
 # ==============================================================================
 def obtener_categorias_hoja_ebay_es(query_es, titulo_es=""):
     print("📂 [Agente 3] Buscando subcategorías hoja válidas en eBay España (Tree 186)...")
@@ -822,7 +859,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         or seo_raw.get("title")
         or seo_raw.get("Title")
         or seo_raw.get("titulo_seo")
-        or f"{producto['titulo_en'][:55]} Envio Europa"
+        or f"{producto['titulo_en'][:55]} Envio Espana"
     ).strip()
 
     for prohibida in ["gratis", "regalo", "oferta", "100%", "garantizado"]:
@@ -837,7 +874,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         or seo_raw.get("description_html")
         or seo_raw.get("descripcion")
         or seo_raw.get("description")
-        or f"<p><b>Calidad y Diseño Moderno - Envío desde Europa</b></p><p>{texto_limpio[:500]}</p><ul><li>Envío rápido desde almacén europeo en 3 a 7 días laborables.</li><li>Devolución aceptada en 14 días según normativa europea.</li></ul>"
+        or f"<p><b>Calidad y Diseño Moderno - Envío desde España</b></p><p>{texto_limpio[:500]}</p><ul><li>Envío rápido desde almacén en España.</li><li>Devolución aceptada en 14 días según normativa europea.</li></ul>"
     )
     descripcion = re.sub(r"https?://\S+|www\.\S+", "", str(descripcion))
 
@@ -865,7 +902,6 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
 
 def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles_vendedor, incluir_mejor_oferta=True):
     titulo_xml = limpiar_xml(seo["titulo"])
-    pais_almacen = producto.get("almacen", "DE")
 
     bloque_politicas = ""
     if perfiles_vendedor and perfiles_vendedor.get("opted_in"):
@@ -899,8 +935,9 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
         <PrimaryCategory><CategoryID>{cat_id}</CategoryID></PrimaryCategory>
         <StartPrice>{producto['precio_venta']}</StartPrice>
         <ConditionID>1000</ConditionID>
-        <Country>{pais_almacen}</Country>
-        <Location>Unión Europea</Location>
+        <Country>ES</Country>
+        <PostalCode>08001</PostalCode>
+        <Location>Barcelona, España</Location>
         <Currency>EUR</Currency>
         <DispatchTimeMax>2</DispatchTimeMax>
         <ListingDuration>GTC</ListingDuration>
@@ -922,7 +959,7 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
     </AddFixedPriceItemRequest>"""
 
 def agente_3_publicar_tienda_europa(producto, perfiles):
-    print("🛒 [Agente 3 - Tienda UE] Preparando ficha limpia para eBay Europa...")
+    print("🛒 [Agente 3 - Tienda ES] Preparando ficha limpia para eBay España...")
     texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:800]
 
     seo_raw = llamar_groq(
@@ -935,7 +972,7 @@ Devuelve este JSON exacto:
 {{
   "query_categoria": "2 palabras en español del objeto",
   "titulo": "Título descriptivo en español de 55 a 75 caracteres con palabras clave de búsqueda",
-  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara y objetiva del producto en español.</p><ul><li>Característica 1</li><li>Característica 2</li><li>Envío rápido desde almacén europeo en 3 a 7 días laborables.</li></ul>",
+  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara y objetiva del producto en español.</p><ul><li>Característica 1</li><li>Característica 2</li><li>Envío rápido desde almacén en España.</li></ul>",
   "specifics": {{
     "Marca": "Sin marca",
     "Tipo": "Accesorio de hogar",
@@ -1004,7 +1041,7 @@ def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
         payload_pin = {
             "board_id": PINTEREST_BOARD_ID,
             "title": seo["titulo"][:100],
-            "description": f"{gancho} ✨ Envío desde Europa en 3-7 días.",
+            "description": f"{gancho} ✨ Envío rápido desde España.",
             "link": ebay_link,
             "media_source": {
                 "source_type": "image_url",
@@ -1040,7 +1077,7 @@ def agente_5_atencion_clientes():
             pregunta = msg.find(".//eb:Body", ns).text
 
             borrador = llamar_groq(
-                "Eres soporte oficial de nuestra tienda en eBay Europa. Sé amable y directo. Enviamos desde Europa en 3-7 días laborables con seguimiento y 14 días de garantía.",
+                "Eres soporte oficial de nuestra tienda en eBay España. Sé amable y directo. Enviamos desde España con seguimiento y 14 días de garantía.",
                 f"El comprador '{sender}' pregunta: '{pregunta}'. Redacta la respuesta lista para enviar:",
                 json_mode=False
             )
@@ -1064,59 +1101,68 @@ def agente_5_atencion_clientes():
 if __name__ == "__main__":
     print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR MES COMPLETO (29 DÍAS) ===")
 
-    # 1. Vigilancia diaria obligatoria: poda día 29 (exprime el mes sin renovar) + pedidos + trackings + mensajes
-    skus_activos, podados, ganadores = agente_6_datos_podar_catalogo()
+    # 1. Vigilancia diaria obligatoria (0,00€): poda día 29 + pedidos CJ + trackings + mensajes
+    skus_activos, titulos_activos, podados, ganadores, min_dias_activo = agente_6_datos_podar_catalogo()
     pedidos_nuevos, trackings_subidos = agente_4_pedidos_y_tracking_automatico()
     agente_5_atencion_clientes()
 
-    # 2. Publicar 1 único producto ganador por semana (Domingo=6) o ejecución manual
-    evento_github = os.environ.get("GITHUB_EVENT_NAME", "")
-    dia_semana = datetime.datetime.now(datetime.timezone.utc).weekday()
-    toca_publicar = (evento_github == "workflow_dispatch") or (dia_semana == 6)
-
-    if toca_publicar:
-        perfiles = obtener_politicas_vendedor_ebay()
-        candidatos = agente_1_cazar_candidatos_seguros(skus_activos, max_candidatos=5)
-
-        publicado_ok = False
-        ultimo_error = ""
-
-        for cand in candidatos:
-            seo, item_id, cat_id, error_ebay = agente_3_publicar_tienda_europa(cand, perfiles)
-            if not error_ebay and item_id != "ERROR_EBAY":
-                variantes = agente_2_diseno_multimedia(cand)
-                canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
-
-                texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "Construyendo primeras ventas"
-                informe = (
-                    f"🟢 ZONA 2 PRO — PRODUCTO SEMANAL PUBLICADO\n\n"
-                    f"📦 Producto: {seo['titulo']} ({STOCK_POR_ANUNCIO} uds.)\n"
-                    f"🏭 Almacén: {cand['almacen']} (Unión Europea)\n"
-                    f"💶 PVP: {cand['precio_venta']}€ (Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
-                    f"📊 Costes cubiertos: Prod {cand['coste_cj']}€ + Envío {cand['envio_real_ue']}€ + Com. eBay {cand['comision_ebay']}€ + Ads 2.5% {cand['coste_promo']}€ + Ins. {TARIFA_INSERCION_EBAY}€\n"
-                    f"💰 Limpio 1ª venta: +{cand['beneficio_neto']}€ | 2ª y 3ª venta: +{cand['beneficio_siguientes']}€\n"
-                    f"🌍 Activo en: {canales}\n"
-                    f"✂️ Podados hoy (29d): {podados} | 🚚 Pedidos: {pedidos_nuevos} | 📦 Trackings: {trackings_subidos}\n"
-                    f"👑 Ganadores: {texto_ganadores}"
-                )
-                enviar_telegram(
-                    informe,
-                    botones=[[
-                        {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"}
-                    ]]
-                )
-                publicado_ok = True
-                break
-            else:
-                ultimo_error = error_ebay
-                print("⏭️ Probando siguiente producto candidato seguro...")
-
-        if not publicado_ok:
-            enviar_telegram(
-                f"⚠️ AVISO DE EBAY AL PUBLICAR:\n{ultimo_error}\n\n"
-                f"El bot lo volverá a intentar automáticamente en el próximo ciclo programado."
-            )
+    # 2. Control de publicaciones semanales
+    if PAUSAR_PUBLICACIONES:
+        print("⏸️ [Modo Solo Vigilancia] PAUSAR_PUBLICACIONES=True: 0€ gasto en anuncios nuevos hasta reactivar el 22 de diciembre.")
     else:
-        print(f"ℹ️ Hoy (día {dia_semana}) solo toca mantenimiento de pedidos, tracking y poda (0€ gasto).")
+        evento_github = os.environ.get("GITHUB_EVENT_NAME", "")
+        ahora_utc = datetime.datetime.now(datetime.timezone.utc)
+        dia_semana = ahora_utc.weekday()
+        ya_publico_esta_semana = (min_dias_activo is not None and min_dias_activo < 6)
+
+        toca_publicar = (
+            (evento_github == "workflow_dispatch")
+            or (dia_semana == 6 and ahora_utc.hour >= 14 and not ya_publico_esta_semana)
+        )
+
+        if toca_publicar:
+            perfiles = obtener_politicas_vendedor_ebay()
+            candidatos = agente_1_cazar_candidatos_seguros(skus_activos, titulos_activos, max_candidatos=3)
+
+            publicado_ok = False
+            ultimo_error = ""
+
+            for cand in candidatos:
+                seo, item_id, cat_id, error_ebay = agente_3_publicar_tienda_europa(cand, perfiles)
+                if not error_ebay and item_id != "ERROR_EBAY":
+                    variantes = agente_2_diseno_multimedia(cand)
+                    canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
+
+                    texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "Construyendo primeras ventas"
+                    informe = (
+                        f"🟢 ZONA 2 PRO — PRODUCTO SEMANAL PUBLICADO\n\n"
+                        f"📦 Producto: {seo['titulo']} ({STOCK_POR_ANUNCIO} uds.)\n"
+                        f"🏭 Almacén: {cand['almacen']} (España)\n"
+                        f"💶 PVP: {cand['precio_venta']}€ (Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
+                        f"📊 Costes cubiertos: Prod {cand['coste_cj']}€ + Envío {cand['envio_real_ue']}€ + Com. eBay {cand['comision_ebay']}€ + Ads 2.5% {cand['coste_promo']}€ + Ins. {TARIFA_INSERCION_EBAY}€\n"
+                        f"💰 Limpio 1ª venta: +{cand['beneficio_neto']}€ | 2ª y 3ª venta: +{cand['beneficio_siguientes']}€\n"
+                        f"🌍 Activo en: {canales}\n"
+                        f"✂️ Podados hoy (29d): {podados} | 🚚 Pedidos: {pedidos_nuevos} | 📦 Trackings: {trackings_subidos}\n"
+                        f"👑 Ganadores: {texto_ganadores}"
+                    )
+                    enviar_telegram(
+                        informe,
+                        botones=[[
+                            {"text": "🚀 Ver Anuncio en eBay", "url": f"https://www.ebay.es/itm/{item_id}"}
+                        ]]
+                    )
+                    publicado_ok = True
+                    break
+                else:
+                    ultimo_error = error_ebay
+                    print("⏭️ Probando siguiente producto candidato seguro...")
+
+            if not publicado_ok:
+                enviar_telegram(
+                    f"⚠️ AVISO DE EBAY AL PUBLICAR:\n{ultimo_error}\n\n"
+                    f"El bot lo volverá a intentar automáticamente en el próximo ciclo programado."
+                )
+        else:
+            print(f"ℹ️ Hoy (día {dia_semana}) solo toca mantenimiento de pedidos, tracking y poda (0€ gasto).")
 
     print("=== CICLO COMPLETADO ===")
