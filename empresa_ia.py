@@ -7,6 +7,7 @@ import math
 import time
 import random
 import base64
+import statistics
 import datetime
 import requests
 import numpy as np
@@ -19,7 +20,7 @@ from io import BytesIO
 # ==============================================================================
 # INTERRUPTOR MAESTRO DE PAUSA (CAMBIAR A False EL 22 DE DICIEMBRE PARA REACTIVAR)
 # ==============================================================================
-PAUSAR_PUBLICACIONES = True  # True = 0€ gasto, solo vigila ventas/envíos y borra al día 29
+PAUSAR_PUBLICACIONES = True  # True = 0€ gasto, solo vigila ventas/envíos/stock y borra al día 29
 
 # ==============================================================================
 # CONFIGURACIÓN Y CREDENCIALES DESDE GITHUB SECRETS
@@ -96,12 +97,15 @@ def obtener_token_ebay_vivo():
             "grant_type": "refresh_token",
             "refresh_token": EBAY_REFRESH_TOKEN
         }
-        res = requests.post(EBAY_OAUTH_URL, headers=headers, data=data, timeout=15)
-        if res.status_code == 200:
-            print("🔑 [Seguridad] Token de eBay renovado automáticamente con éxito (18 meses activo).")
-            return res.json().get("access_token")
-        else:
-            print(f"⚠️ Error renovando token eBay ({res.status_code}): {res.text}")
+        try:
+            res = requests.post(EBAY_OAUTH_URL, headers=headers, data=data, timeout=15)
+            if res.status_code == 200:
+                print("🔑 [Seguridad] Token de eBay renovado automáticamente con éxito (18 meses activo).")
+                return res.json().get("access_token")
+            else:
+                print(f"⚠️ Error renovando token eBay ({res.status_code}): {res.text}")
+        except Exception as e:
+            print(f"⚠️ Aviso red renovando token eBay: {e}")
     return EBAY_STATIC_TOKEN
 
 EBAY_ACTIVE_TOKEN = obtener_token_ebay_vivo()
@@ -160,13 +164,16 @@ def obtener_modelo_groq_activo():
 GROQ_MODEL_ACTIVO = obtener_modelo_groq_activo()
 
 def obtener_access_token_cj():
-    url = "https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken"
-    res = requests.post(url, json={"apiKey": CJ_TOKEN}, timeout=15).json()
-    time.sleep(1.2)
-    if res.get("result") and res.get("data", {}).get("accessToken"):
-        print("🔑 [CJ Dropshipping] Access Token obtenido correctamente.")
-        return res["data"]["accessToken"]
-    print(f"⚠️ Aviso token CJ: {res.get('message', 'Usando API Key directa')}")
+    try:
+        url = "https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken"
+        res = requests.post(url, json={"apiKey": CJ_TOKEN}, timeout=15).json()
+        time.sleep(1.2)
+        if res.get("result") and res.get("data", {}).get("accessToken"):
+            print("🔑 [CJ Dropshipping] Access Token obtenido correctamente.")
+            return res["data"]["accessToken"]
+        print(f"⚠️ Aviso token CJ: {res.get('message', 'Usando API Key directa')}")
+    except Exception as e:
+        print(f"⚠️ Aviso conectando con CJ: {e}")
     return CJ_TOKEN
 
 CJ_ACCESS_TOKEN = obtener_access_token_cj()
@@ -188,7 +195,12 @@ def llamar_groq(system_prompt, user_prompt, json_mode=True):
         ]
     }
 
-    res = requests.post(url, headers=headers, json=payload, timeout=35).json()
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=35).json()
+    except Exception as e:
+        print(f"⚠️ Error de red llamando a Groq: {e}")
+        return {} if json_mode else ""
+
     if "choices" not in res:
         print(f"⚠️ Respuesta inesperada de Groq: {res}")
         return {} if json_mode else ""
@@ -247,11 +259,14 @@ def ebay_xml_call(call_name, xml_body):
 def enviar_telegram(texto, botones=None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texto}
-    if botones:
-        payload["reply_markup"] = {"inline_keyboard": botones}
-    requests.post(url, json=payload, timeout=15)
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": texto}
+        if botones:
+            payload["reply_markup"] = {"inline_keyboard": botones}
+        requests.post(url, json=payload, timeout=15)
+    except Exception as e:
+        print(f"⚠️ Aviso enviando Telegram: {e}")
 
 def consultar_envio_real_cj(vid, origen_ue, destino_ue="ES"):
     """Consulta la tarifa logística real en CJ Dropshipping para no perder dinero nunca."""
@@ -285,19 +300,89 @@ def consultar_envio_real_cj(vid, origen_ue, destino_ue="ES"):
         print(f"⚠️ Aviso consultando envío real CJ ({origen_ue}->{destino_ue}): {e}")
     return None, None
 
-def calcular_economia_blindada(coste_prod_real, envio_real_ue):
-    """Fija precio .95€ amortizando tarifa inserción (0.42€) + Ads 2.5% + envío real desde la 1ª venta."""
+def espiar_competencia_ebay_es(query_busqueda):
+    """Analiza precios reales (producto + envío) y títulos top de la competencia en eBay España."""
+    token_pub = obtener_token_publico_ebay()
+    if not token_pub or not query_busqueda:
+        return None
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {token_pub}",
+            "X-EBAY-C-MARKETPLACE-ID": "EBAY_ES",
+            "Accept": "application/json"
+        }
+        q_clean = re.sub(r"[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑ\s]", " ", str(query_busqueda))
+        q_corta = " ".join(q_clean.split()[:5])
+        url = f"https://api.ebay.com/buy/browse/v1/item_summary/search?q={requests.utils.quote(q_corta)}&limit=10&filter=buyingOptions:%7BFIXED_PRICE%7D,itemLocationCountry:ES"
+        res = requests.get(url, headers=headers, timeout=15)
+
+        if res.status_code != 200:
+            url_ue = f"https://api.ebay.com/buy/browse/v1/item_summary/search?q={requests.utils.quote(q_corta)}&limit=10&filter=buyingOptions:%7BFIXED_PRICE%7D"
+            res = requests.get(url_ue, headers=headers, timeout=15)
+
+        if res.status_code == 200:
+            items = res.json().get("itemSummaries") or []
+            precios_totales = []
+            titulos_top = []
+            for it in items:
+                p_obj = it.get("price") or {}
+                if p_obj.get("currency") != "EUR":
+                    continue
+                try:
+                    p_base = float(p_obj.get("value", 0))
+                    envio = 0.0
+                    ship_opts = it.get("shippingOptions") or []
+                    if ship_opts and ship_opts[0].get("shippingCost"):
+                        envio = float(ship_opts[0]["shippingCost"].get("value", 0))
+                    total_comp = round(p_base + envio, 2)
+                    if 4.0 <= total_comp <= 80.0:
+                        precios_totales.append(total_comp)
+                        if it.get("title"):
+                            titulos_top.append(it["title"].strip())
+                except (ValueError, TypeError):
+                    continue
+
+            if len(precios_totales) >= 2:
+                mediana = round(statistics.median(precios_totales), 2)
+                minimo = round(min(precios_totales), 2)
+                print(f"🕵️ [Radar eBay ES] '{q_corta}' -> {len(precios_totales)} rivales | Mín: {minimo}€ | Mediana: {mediana}€")
+                return {
+                    "mediana": mediana,
+                    "minimo": minimo,
+                    "muestras": len(precios_totales),
+                    "titulos_top": titulos_top[:5]
+                }
+    except Exception as e:
+        print(f"⚠️ Aviso en Radar eBay ES (modo respaldo activo): {e}")
+
+    return None
+
+def calcular_economia_blindada(coste_prod_real, envio_real_ue, mediana_competencia=None):
+    """Fija precio .95€ amortizando inserción (0.42€) + Ads 2.5% + envío real, maximizando margen bajo competencia."""
     envio_asegurado = round(envio_real_ue + COLCHON_SEGURIDAD_ENVIO, 2)
     coste_total_cj = round(coste_prod_real + envio_asegurado, 2)
     tasa_total_ebay = (0.115 + TASA_PROMO_EBAY) * 1.21
     fijo_ebay = 0.35 * 1.21
 
     precio_bruto = (coste_total_cj + fijo_ebay + TARIFA_INSERCION_EBAY + BENEFICIO_MINIMO_OBJETIVO) / (1.0 - tasa_total_ebay)
-    precio_psicologico = math.floor(precio_bruto) + 0.95
-    if precio_psicologico < precio_bruto - 0.10:
-        precio_psicologico += 1.00
+    precio_minimo_psicologico = math.floor(precio_bruto) + 0.95
+    if precio_minimo_psicologico < precio_bruto - 0.10:
+        precio_minimo_psicologico += 1.00
+    precio_minimo_psicologico = round(precio_minimo_psicologico, 2)
 
-    precio_venta = round(precio_psicologico, 2)
+    precio_venta = precio_minimo_psicologico
+
+    # Si la competencia real en eBay España vende más caro que nuestro suelo rentable,
+    # nos colocamos justo por debajo de su mediana para ganarles en precio y capturar máximo margen
+    if mediana_competencia and mediana_competencia > precio_minimo_psicologico + 1.00:
+        objetivo_comp = min(mediana_competencia - 0.50, PRECIO_MAXIMO_ROTACION)
+        precio_comp = math.floor(objetivo_comp) + 0.95
+        if precio_comp > objetivo_comp:
+            precio_comp -= 1.00
+        if precio_comp > precio_minimo_psicologico:
+            precio_venta = round(precio_comp, 2)
+
     comision_ebay = round((precio_venta * 0.115 + 0.35) * 1.21, 2)
     coste_promo = round((precio_venta * TASA_PROMO_EBAY) * 1.21, 2)
 
@@ -312,6 +397,7 @@ def calcular_economia_blindada(coste_prod_real, envio_real_ue):
         "envio_real_ue": round(envio_real_ue, 2),
         "envio_asegurado": envio_asegurado,
         "coste_total_cj": coste_total_cj,
+        "precio_minimo": precio_minimo_psicologico,
         "precio_venta": precio_venta,
         "comision_ebay": comision_ebay,
         "coste_promo": coste_promo,
@@ -322,10 +408,44 @@ def calcular_economia_blindada(coste_prod_real, envio_real_ue):
     }
 
 # ==============================================================================
-# AGENTE 6 (DATOS Y PODADOR): Audita catálogo y retira muertos al día 29
+# AGENTE 6 (DATOS, PODADOR Y ESCUDO STOCK/PRECIO CJ): Mantenimiento 0,00€
 # ==============================================================================
+def obtener_detalle_variante_cj(pid):
+    try:
+        time.sleep(1.1)
+        url = f"https://developers.cjdropshipping.com/api2.0/v1/product/query?pid={pid}"
+        res = requests.get(url, headers={"CJ-Access-Token": CJ_ACCESS_TOKEN}, timeout=15).json()
+        if not res.get("result"):
+            return None, None, 0.0
+        data = res.get("data") or {}
+        variantes = data.get("variants") or []
+        vid_elegido = None
+        precio_max = 0.0
+
+        for v in variantes:
+            try:
+                p = float(str(v.get("variantSellPrice", "0")).split("-")[0].strip())
+                if p >= precio_max:
+                    precio_max = p
+                    vid_elegido = v.get("vid")
+            except ValueError:
+                continue
+
+        if not vid_elegido and variantes:
+            vid_elegido = variantes[0].get("vid")
+        if precio_max <= 0:
+            try:
+                precio_max = float(str(data.get("sellPrice", "0")).split("-")[0].strip())
+            except ValueError:
+                precio_max = 0.0
+
+        return data, vid_elegido, precio_max
+    except Exception as e:
+        print(f"⚠️ Aviso consultando detalle CJ ({pid}): {e}")
+        return None, None, 0.0
+
 def agente_6_datos_podar_catalogo():
-    print("📊 [Agente 6 - Datos] Auditando catálogo activo en eBay...")
+    print("📊 [Agente 6 - Datos] Auditando catálogo activo en eBay (poda 29d + escudo CJ)...")
     if not EBAY_ACTIVE_TOKEN:
         print("⚠️ Sin token activo de eBay, saltando auditoría inicial.")
         return [], [], 0, [], None
@@ -345,7 +465,7 @@ def agente_6_datos_podar_catalogo():
     skus_activos = []
     titulos_activos = []
     eliminados = 0
-    podados_nombres = []
+    podados_motivos = []
     ganadores = []
     min_dias_activo = None
 
@@ -364,8 +484,12 @@ def agente_6_datos_podar_catalogo():
             titulo_item = titulo_el.text.strip() if (titulo_el is not None and titulo_el.text) else item_id
 
             sku_el = item.find("eb:SKU", ns)
-            if sku_el is not None and sku_el.text:
-                skus_activos.append(sku_el.text.strip())
+            sku_txt = sku_el.text.strip() if (sku_el is not None and sku_el.text) else ""
+            if sku_txt:
+                skus_activos.append(sku_txt)
+
+            precio_el = item.find(".//eb:CurrentPrice", ns)
+            precio_ebay = float(precio_el.text.strip()) if (precio_el is not None and precio_el.text) else 0.0
 
             start_el = item.find(".//eb:StartTime", ns)
             dias = 0
@@ -379,8 +503,24 @@ def agente_6_datos_podar_catalogo():
             if vendidos > 0:
                 ganadores.append(f"{titulo_item[:28]}... ({vendidos} v.)")
 
-            # Se retira al día 29 si tiene 0 ventas para exprimir el mes entero sin pagar renovación
+            motivo_cierre = None
+
+            # 1. Poda automática al día 29 si tiene 0 ventas para evitar renovación día 30
             if dias >= DIAS_PODA_SIN_VENTAS and vendidos == 0:
+                motivo_cierre = "29 días sin ventas (ahorro renovación)"
+
+            # 2. Escudo anti-pérdidas y rotura de stock en CJ Dropshipping
+            elif sku_txt and precio_ebay > 0 and CJ_ACCESS_TOKEN:
+                data_cj, vid_cj, coste_actual_cj = obtener_detalle_variante_cj(sku_txt)
+                if data_cj is not None:
+                    if not vid_cj or coste_actual_cj <= 0:
+                        motivo_cierre = "Producto agotado/descatalogado en CJ"
+                    else:
+                        ingreso_neto_est = precio_ebay - ((precio_ebay * (0.115 + TASA_PROMO_EBAY) + 0.35) * 1.21)
+                        if coste_actual_cj > ingreso_neto_est - 3.00:
+                            motivo_cierre = f"Subida de coste en CJ ({coste_actual_cj}€) rompe margen"
+
+            if motivo_cierre:
                 end_xml = f"""<?xml version="1.0" encoding="utf-8"?>
                 <EndFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
                   <ItemID>{item_id}</ItemID>
@@ -388,57 +528,29 @@ def agente_6_datos_podar_catalogo():
                 </EndFixedPriceItemRequest>"""
                 ebay_xml_call("EndFixedPriceItem", end_xml)
                 eliminados += 1
-                podados_nombres.append(titulo_item[:42])
-                print(f"✂️ [Agente 6] Retirado tras exprimir {dias} días sin ventas: {titulo_item[:45]}")
+                podados_motivos.append(f"• {titulo_item[:38]} → {motivo_cierre}")
+                print(f"✂️ [Agente 6] Retirado ({motivo_cierre}): {titulo_item[:45]}")
             else:
                 titulos_activos.append(titulo_item.lower())
                 if min_dias_activo is None or dias < min_dias_activo:
                     min_dias_activo = dias
 
         if eliminados > 0:
-            lista_txt = "\n".join([f"• {n}" for n in podados_nombres])
+            lista_txt = "\n".join(podados_motivos)
             enviar_telegram(
-                f"✂️ PODA AUTOMÁTICA DÍA 29 COMPLETADA\n\n"
-                f"Se han retirado {eliminados} anuncio(s) sin ventas antes de la renovación del día 30 (0,00 € coste):\n"
+                f"✂️ MANTENIMIENTO AUTOMÁTICO DE CATÁLOGO\n\n"
+                f"Se han cerrado {eliminados} anuncio(s) a coste 0,00 €:\n"
                 f"{lista_txt}"
             )
     except Exception as e:
         print(f"Aviso en lectura de catálogo activo: {e}")
 
-    print(f"📋 [Agente 6] Anuncios activos vigentes: {len(titulos_activos)} | Podados hoy: {eliminados}")
+    print(f"📋 [Agente 6] Anuncios activos vigentes: {len(titulos_activos)} | Retirados hoy: {eliminados}")
     return skus_activos, titulos_activos, eliminados, ganadores, min_dias_activo
 
 # ==============================================================================
 # AGENTE 4 (PEDIDOS + PAGO CJ WALLET + TRACKING): Automatiza compras y envíos
 # ==============================================================================
-def obtener_detalle_variante_cj(pid):
-    time.sleep(1.1)
-    url = f"https://developers.cjdropshipping.com/api2.0/v1/product/query?pid={pid}"
-    res = requests.get(url, headers={"CJ-Access-Token": CJ_ACCESS_TOKEN}, timeout=15).json()
-    data = res.get("data") or {}
-    variantes = data.get("variants") or []
-    vid_elegido = None
-    precio_max = 0.0
-
-    for v in variantes:
-        try:
-            p = float(str(v.get("variantSellPrice", "0")).split("-")[0].strip())
-            if p >= precio_max:
-                precio_max = p
-                vid_elegido = v.get("vid")
-        except ValueError:
-            continue
-
-    if not vid_elegido and variantes:
-        vid_elegido = variantes[0].get("vid")
-    if precio_max <= 0:
-        try:
-            precio_max = float(str(data.get("sellPrice", "0")).split("-")[0].strip())
-        except ValueError:
-            precio_max = 0.0
-
-    return data, vid_elegido, precio_max
-
 def agente_4_pedidos_y_tracking_automatico():
     print("🚚 [Agente 4 - Pedidos y Tracking] Comprobando ventas pendientes en eBay...")
     if not EBAY_ACTIVE_TOKEN or not CJ_ACCESS_TOKEN:
@@ -619,14 +731,14 @@ def agente_4_pedidos_y_tracking_automatico():
     return pedidos_tramitados, trackings_subidos
 
 # ==============================================================================
-# AGENTE 1 (TENDENCIAS): Selecciona 1 candidato único en almacén España (ES)
+# AGENTE 1 (TENDENCIAS + RADAR COMPETENCIA): Prioriza el mayor margen ganador
 # ==============================================================================
 def es_producto_seguro_ue(titulo_en):
     palabras = set(re.findall(r"[a-z]+", str(titulo_en).lower()))
     return len(palabras.intersection(PALABRAS_PROHIBIDAS_UE)) == 0
 
-def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_candidatos=3):
-    print("🔍 [Agente 1 - Tendencias] Buscando 1 producto competitivo en almacén España (ES)...")
+def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_candidatos=6):
+    print("🔍 [Agente 1 - Radar Competitivo] Buscando productos en España (ES) priorizando máximo margen bajo competencia...")
     headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN}
     lista_keywords = ["organizer", "lamp", "holder", "storage", "decor", "rack", "kitchen", "stand"]
     random.shuffle(lista_keywords)
@@ -662,8 +774,16 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_can
                 except ValueError:
                     continue
 
-                if 2.5 <= coste_base <= 12.5:
+                try:
+                    listed_num = int(prod.get("listedNum") or 0)
+                except (ValueError, TypeError):
+                    listed_num = 0
+
+                # Rango 2,00€ - 11,50€ para captar también artículos de ~10€ total que se venden a 20€-25€
+                if 2.0 <= coste_base <= 11.5:
                     det_data, vid, coste_variante_max = obtener_detalle_variante_cj(pid)
+                    if not det_data or not vid:
+                        continue
                     coste_prod_real = max(coste_base, coste_variante_max)
 
                     fotos = det_data.get("productImageSet") or [prod.get("productImage")]
@@ -682,15 +802,31 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_can
                     tarifas_validas = [t for t in (envio_es, envio_fr) if t is not None]
                     envio_real_ue = max(tarifas_validas) if tarifas_validas else ENVIO_RESPALDO_CONSERVADOR
 
-                    eco = calcular_economia_blindada(coste_prod_real, envio_real_ue)
-                    if eco["precio_venta"] > PRECIO_MAXIMO_ROTACION or eco["beneficio_neto"] < 2.95:
+                    # Calculamos primero nuestro suelo rentable mínimo
+                    eco_base = calcular_economia_blindada(coste_prod_real, envio_real_ue, None)
+                    if eco_base["precio_minimo"] > PRECIO_MAXIMO_ROTACION or eco_base["beneficio_neto"] < 2.95:
                         continue
+
+                    # Espiamos la competencia real en eBay España
+                    comp = espiar_competencia_ebay_es(titulo_en)
+                    mediana_comp = comp["mediana"] if comp else None
+                    titulos_rivales = comp["titulos_top"] if comp else []
+
+                    # Si hay competencia real y somos más caros que la mediana del mercado, descartamos sin gastar
+                    if mediana_comp and eco_base["precio_minimo"] > mediana_comp + 0.50:
+                        print(f"⏭️ Descartado por precio alto vs eBay ES ({eco_base['precio_minimo']}€ vs mediana {mediana_comp}€): {titulo_en[:35]}")
+                        continue
+
+                    # Recalculamos precio final optimizado frente a la competencia
+                    eco = calcular_economia_blindada(coste_prod_real, envio_real_ue, mediana_comp)
+                    ventaja_precio = round((mediana_comp - eco["precio_venta"]), 2) if mediana_comp else 0.0
 
                     vistos.add(pid)
                     candidatos.append({
                         "sku": pid,
                         "vid": vid,
                         "almacen": pais,
+                        "listed_num": listed_num,
                         "titulo_en": titulo_en,
                         "descripcion_en": det_data.get("description") or titulo_en,
                         "fotos": fotos_limpias,
@@ -704,15 +840,36 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_can
                         "beneficio_neto": eco["beneficio_neto"],
                         "beneficio_siguientes": eco["beneficio_siguientes"],
                         "oferta_minima": eco["oferta_minima"],
-                        "oferta_autoaceptar": eco["oferta_autoaceptar"]
+                        "oferta_autoaceptar": eco["oferta_autoaceptar"],
+                        "mediana_comp": mediana_comp,
+                        "ventaja_precio": ventaja_precio,
+                        "titulos_rivales": titulos_rivales
                     })
+
                     if len(candidatos) >= max_candidatos:
-                        candidatos.sort(key=lambda x: x["precio_venta"])
+                        # Prioridad 1: competencia real detectada y precio más barato que rivales
+                        # Prioridad 2: mayor beneficio limpio posible
+                        # Prioridad 3: popularidad (listedNum) en CJ
+                        candidatos.sort(
+                            key=lambda x: (
+                                x["mediana_comp"] is not None and x["ventaja_precio"] > 0,
+                                x["beneficio_neto"],
+                                x["listed_num"]
+                            ),
+                            reverse=True
+                        )
                         return candidatos
 
     if not candidatos:
-        raise Exception("No se encontraron candidatos nuevos con margen blindado hoy en España.")
-    candidatos.sort(key=lambda x: x["precio_venta"])
+        raise Exception("No se encontraron candidatos competitivos con margen blindado hoy en España.")
+    candidatos.sort(
+        key=lambda x: (
+            x["mediana_comp"] is not None and x["ventaja_precio"] > 0,
+            x["beneficio_neto"],
+            x["listed_num"]
+        ),
+        reverse=True
+    )
     return candidatos
 
 # ==============================================================================
@@ -774,7 +931,7 @@ def agente_2_diseno_multimedia(producto):
     return lista_variantes
 
 # ==============================================================================
-# AGENTE 3 (TIENDA MULTI-PAÍS): Publica en eBay España con ubicación España
+# AGENTE 3 (TIENDA ESPAÑA): SEO clonado de Top Ventas + Publicación eBay ES
 # ==============================================================================
 def obtener_categorias_hoja_ebay_es(query_es, titulo_es=""):
     print("📂 [Agente 3] Buscando subcategorías hoja válidas en eBay España (Tree 186)...")
@@ -862,7 +1019,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         or f"{producto['titulo_en'][:55]} Envio Espana"
     ).strip()
 
-    for prohibida in ["gratis", "regalo", "oferta", "100%", "garantizado"]:
+    for prohibida in ["gratis", "regalo", "oferta", "100%", "garantizado", "envio rapido"]:
         titulo = re.sub(rf"\b{prohibida}\b", "", titulo, flags=re.IGNORECASE).strip()
     titulo = re.sub(r"\s+", " ", titulo)
 
@@ -892,6 +1049,16 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
             "Color": "Neutro",
             "Material": "Plástico ABS / Metal"
         }
+
+    defaults_seguros = {
+        "Marca": "Sin marca",
+        "Modelo": "Estándar",
+        "Alto": "15 cm",
+        "Ancho": "15 cm"
+    }
+    for k_def, v_def in defaults_seguros.items():
+        if k_def not in specifics or not str(specifics[k_def]).strip():
+            specifics[k_def] = v_def
 
     return {
         "query_categoria": str(query_cat),
@@ -959,25 +1126,30 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
     </AddFixedPriceItemRequest>"""
 
 def agente_3_publicar_tienda_europa(producto, perfiles):
-    print("🛒 [Agente 3 - Tienda ES] Preparando ficha limpia para eBay España...")
+    print("🛒 [Agente 3 - Tienda ES] Preparando ficha SEO inspirada en Top Ventas eBay España...")
     texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:800]
+    rivales_txt = "\n".join([f"- {t}" for t in producto.get("titulos_rivales", [])]) or "Sin referencias previas"
 
     seo_raw = llamar_groq(
         "Eres un experto en SEO y cumplimiento de políticas para eBay España. Prohibido usar palabras promocionales como 'gratis', 'oferta', '100%', marcas registradas, URLs o reclamos médicos. Devuelve únicamente JSON válido.",
-        f"""Traduce y optimiza este producto para eBay España con palabras clave que busquen los compradores reales.
-Producto: {producto['titulo_en']}
+        f"""Optimiza este producto para eBay España superando a los anuncios mejor posicionados del mercado.
+Producto proveedor: {producto['titulo_en']}
 Detalles: {texto_limpio}
+Títulos reales de competidores top en eBay España (úsalos para extraer las palabras clave exactas que buscan los clientes):
+{rivales_txt}
 
 Devuelve este JSON exacto:
 {{
   "query_categoria": "2 palabras en español del objeto",
-  "titulo": "Título descriptivo en español de 55 a 75 caracteres con palabras clave de búsqueda",
-  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara y objetiva del producto en español.</p><ul><li>Característica 1</li><li>Característica 2</li><li>Envío rápido desde almacén en España.</li></ul>",
+  "titulo": "Título descriptivo en español de 60 a 76 caracteres con las mejores palabras clave de búsqueda",
+  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara, convincente y objetiva del producto en español.</p><ul><li>Ventaja práctica 1</li><li>Ventaja práctica 2</li><li>Envío rápido desde almacén en España.</li></ul>",
   "specifics": {{
     "Marca": "Sin marca",
     "Tipo": "Accesorio de hogar",
     "Color": "Neutro",
-    "Material": "Alta resistencia"
+    "Material": "Alta resistencia",
+    "Alto": "15 cm",
+    "Ancho": "15 cm"
   }}
 }}"""
     )
@@ -1032,25 +1204,28 @@ def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
     canales_activos = ["eBay ES + Unión Europea", "Mejor Oferta Auto", "Vídeo Reel MP4", "Lote Canva CSV"]
 
     if PINTEREST_TOKEN and PINTEREST_BOARD_ID and item_id != "ERROR_EBAY":
-        url_pin = "https://api.pinterest.com/v5/pins"
-        headers_pin = {
-            "Authorization": f"Bearer {PINTEREST_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        gancho = variantes[0].get("angulo", seo["titulo"]) if variantes else seo["titulo"]
-        payload_pin = {
-            "board_id": PINTEREST_BOARD_ID,
-            "title": seo["titulo"][:100],
-            "description": f"{gancho} ✨ Envío rápido desde España.",
-            "link": ebay_link,
-            "media_source": {
-                "source_type": "image_url",
-                "url": producto["fotos"][0]
+        try:
+            url_pin = "https://api.pinterest.com/v5/pins"
+            headers_pin = {
+                "Authorization": f"Bearer {PINTEREST_TOKEN}",
+                "Content-Type": "application/json"
             }
-        }
-        r_pin = requests.post(url_pin, headers=headers_pin, json=payload_pin, timeout=15)
-        if r_pin.status_code in (200, 201):
-            canales_activos.append("Pinterest Orgánico")
+            gancho = variantes[0].get("angulo", seo["titulo"]) if variantes else seo["titulo"]
+            payload_pin = {
+                "board_id": PINTEREST_BOARD_ID,
+                "title": seo["titulo"][:100],
+                "description": f"{gancho} ✨ Envío rápido desde España.",
+                "link": ebay_link,
+                "media_source": {
+                    "source_type": "image_url",
+                    "url": producto["fotos"][0]
+                }
+            }
+            r_pin = requests.post(url_pin, headers=headers_pin, json=payload_pin, timeout=15)
+            if r_pin.status_code in (200, 201):
+                canales_activos.append("Pinterest Orgánico")
+        except Exception as e:
+            print(f"⚠️ Aviso en Pinterest (no crítico): {e}")
 
     return ", ".join(canales_activos)
 
@@ -1060,38 +1235,42 @@ def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
 def agente_5_atencion_clientes():
     if not EBAY_ACTIVE_TOKEN:
         return
-    xml = """<?xml version="1.0" encoding="utf-8"?>
-    <GetMemberMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-      <MailMessageType>AskSellerQuestion</MailMessageType>
-      <MessageStatus>Unanswered</MessageStatus>
-    </GetMemberMessagesRequest>"""
-    res_xml = ebay_xml_call("GetMemberMessages", xml)
-
     try:
+        xml = """<?xml version="1.0" encoding="utf-8"?>
+        <GetMemberMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+          <MailMessageType>AskSellerQuestion</MailMessageType>
+          <MessageStatus>Unanswered</MessageStatus>
+        </GetMemberMessagesRequest>"""
+        res_xml = ebay_xml_call("GetMemberMessages", xml)
+
         root = ET.fromstring(res_xml)
         ns = {"eb": "urn:ebay:apis:eBLBaseComponents"}
         for msg in root.findall(".//eb:MemberMessageExchange", ns):
-            msg_id = msg.find(".//eb:MessageID", ns).text
-            sender = msg.find(".//eb:SenderID", ns).text
-            item_id = msg.find(".//eb:ItemID", ns).text
-            pregunta = msg.find(".//eb:Body", ns).text
+            try:
+                msg_id = msg.find(".//eb:MessageID", ns).text
+                sender = msg.find(".//eb:SenderID", ns).text
+                item_id = msg.find(".//eb:ItemID", ns).text
+                pregunta = msg.find(".//eb:Body", ns).text
 
-            borrador = llamar_groq(
-                "Eres soporte oficial de nuestra tienda en eBay España. Sé amable y directo. Enviamos desde España con seguimiento y 14 días de garantía.",
-                f"El comprador '{sender}' pregunta: '{pregunta}'. Redacta la respuesta lista para enviar:",
-                json_mode=False
-            )
+                borrador = llamar_groq(
+                    "Eres soporte oficial de nuestra tienda en eBay España. Sé amable y directo. Enviamos desde España con seguimiento y 14 días de garantía.",
+                    f"El comprador '{sender}' pregunta: '{pregunta}'. Redacta la respuesta lista para enviar:",
+                    json_mode=False
+                )
 
-            reply_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-            <AddMemberMessageRTQRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-              <ItemID>{item_id}</ItemID>
-              <MemberMessage>
-                <Body>{limpiar_xml(borrador)}</Body>
-                <ParentMessageID>{msg_id}</ParentMessageID>
-                <RecipientID>{sender}</RecipientID>
-              </MemberMessage>
-            </AddMemberMessageRTQRequest>"""
-            ebay_xml_call("AddMemberMessageRTQ", reply_xml)
+                if borrador:
+                    reply_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+                    <AddMemberMessageRTQRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+                      <ItemID>{item_id}</ItemID>
+                      <MemberMessage>
+                        <Body>{limpiar_xml(borrador)}</Body>
+                        <ParentMessageID>{msg_id}</ParentMessageID>
+                        <RecipientID>{sender}</RecipientID>
+                      </MemberMessage>
+                    </AddMemberMessageRTQRequest>"""
+                    ebay_xml_call("AddMemberMessageRTQ", reply_xml)
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -1099,14 +1278,14 @@ def agente_5_atencion_clientes():
 # EJECUCIÓN MAESTRA DE LOS 7 AGENTES
 # ==============================================================================
 if __name__ == "__main__":
-    print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR MES COMPLETO (29 DÍAS) ===")
+    print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR COMPETITIVO (29 DÍAS) ===")
 
-    # 1. Vigilancia diaria obligatoria (0,00€): poda día 29 + pedidos CJ + trackings + mensajes
+    # 1. Vigilancia diaria obligatoria (0,00€): poda día 29 + escudo stock/precio CJ + pedidos + trackings + mensajes
     skus_activos, titulos_activos, podados, ganadores, min_dias_activo = agente_6_datos_podar_catalogo()
     pedidos_nuevos, trackings_subidos = agente_4_pedidos_y_tracking_automatico()
     agente_5_atencion_clientes()
 
-    # 2. Control de publicaciones semanales
+    # 2. Control de publicaciones semanales (BLOQUEADO mientras PAUSAR_PUBLICACIONES = True)
     if PAUSAR_PUBLICACIONES:
         print("⏸️ [Modo Solo Vigilancia] PAUSAR_PUBLICACIONES=True: 0€ gasto en anuncios nuevos hasta reactivar el 22 de diciembre.")
     else:
@@ -1122,7 +1301,7 @@ if __name__ == "__main__":
 
         if toca_publicar:
             perfiles = obtener_politicas_vendedor_ebay()
-            candidatos = agente_1_cazar_candidatos_seguros(skus_activos, titulos_activos, max_candidatos=3)
+            candidatos = agente_1_cazar_candidatos_seguros(skus_activos, titulos_activos, max_candidatos=6)
 
             publicado_ok = False
             ultimo_error = ""
@@ -1134,15 +1313,16 @@ if __name__ == "__main__":
                     canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
 
                     texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "Construyendo primeras ventas"
+                    txt_comp = f"{cand['mediana_comp']}€ (ahorro -{cand['ventaja_precio']}€ vs rivales)" if cand.get("mediana_comp") else "Sin rivales directos"
                     informe = (
-                        f"🟢 ZONA 2 PRO — PRODUCTO SEMANAL PUBLICADO\n\n"
+                        f"🟢 ZONA 2 PRO — PRODUCTO TOP MARGEN PUBLICADO\n\n"
                         f"📦 Producto: {seo['titulo']} ({STOCK_POR_ANUNCIO} uds.)\n"
                         f"🏭 Almacén: {cand['almacen']} (España)\n"
-                        f"💶 PVP: {cand['precio_venta']}€ (Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
+                        f"💶 PVP: {cand['precio_venta']}€ (Mediana rivales: {txt_comp} | Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
                         f"📊 Costes cubiertos: Prod {cand['coste_cj']}€ + Envío {cand['envio_real_ue']}€ + Com. eBay {cand['comision_ebay']}€ + Ads 2.5% {cand['coste_promo']}€ + Ins. {TARIFA_INSERCION_EBAY}€\n"
                         f"💰 Limpio 1ª venta: +{cand['beneficio_neto']}€ | 2ª y 3ª venta: +{cand['beneficio_siguientes']}€\n"
                         f"🌍 Activo en: {canales}\n"
-                        f"✂️ Podados hoy (29d): {podados} | 🚚 Pedidos: {pedidos_nuevos} | 📦 Trackings: {trackings_subidos}\n"
+                        f"✂️ Podados hoy: {podados} | 🚚 Pedidos: {pedidos_nuevos} | 📦 Trackings: {trackings_subidos}\n"
                         f"👑 Ganadores: {texto_ganadores}"
                     )
                     enviar_telegram(
@@ -1155,7 +1335,7 @@ if __name__ == "__main__":
                     break
                 else:
                     ultimo_error = error_ebay
-                    print("⏭️ Probando siguiente producto candidato seguro...")
+                    print("⏭️ Probando siguiente producto candidato competitivo...")
 
             if not publicado_ok:
                 enviar_telegram(
