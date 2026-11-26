@@ -50,7 +50,14 @@ BENEFICIO_MINIMO_OBJETIVO = 3.00  # Beneficio limpio mínimo garantizado desde l
 PRECIO_MAXIMO_ROTACION = 29.95    # Tope de PVP para alta conversión y rápida rotación
 STOCK_POR_ANUNCIO = 3             # 3 unidades por anuncio para amortizar la tarifa de 0.42€
 DIAS_PODA_SIN_VENTAS = 29         # Exprime todo el mes pagado y retira justo antes del día 30
-ALMACENES_UE_PERMITIDOS = ["ES"]  # Solo almacén España para evitar exigencia de IVA alemán
+
+# Almacenes UE permitidos (Alemania 'DE' excluida permanentemente por bloqueo IVA §22f)
+ALMACENES_UE_PERMITIDOS = ["ES", "FR", "PL"]
+INFO_ALMACENES_UE = {
+    "ES": {"nombre": "España", "ubicacion": "Barcelona, España", "cp": "08001", "dispatch": 2},
+    "FR": {"nombre": "Francia", "ubicacion": "París, Francia", "cp": None, "dispatch": 3},
+    "PL": {"nombre": "Polonia", "ubicacion": "Varsovia, Polonia", "cp": None, "dispatch": 3},
+}
 
 # Palabras bloqueadas por seguridad UE / políticas de cuentas nuevas en eBay
 PALABRAS_PROHIBIDAS_UE = {
@@ -609,7 +616,7 @@ def agente_4_pedidos_y_tracking_automatico():
             if det_cj.get("result") and det_cj.get("data"):
                 cj_data = det_cj["data"]
                 track_num = str(cj_data.get("trackNumber") or "").strip()
-                carrier = str(cj_data.get("logisticName") or "Correos").strip()
+                carrier = str(cj_data.get("logisticName") or "Standard").strip()
                 cj_oid = str(cj_data.get("orderId") or order_id)
 
                 if track_num:
@@ -713,6 +720,7 @@ def agente_4_pedidos_y_tracking_automatico():
                     enviar_telegram(
                         f"🎉 VENTA TRAMITADA Y PAGADA AUTOMÁTICAMENTE\n\n"
                         f"🧾 Pedido eBay: {order_id}\n"
+                        f"🏭 Almacén salida: {origen_almacen}\n"
                         f"💶 Cobrado neto eBay: {ingreso_neto_ebay}€\n"
                         f"🏭 Pagado CJ Wallet: -{coste_total_cj_pedido}€\n"
                         f"💰 Beneficio limpio real: +{beneficio_pedido}€"
@@ -721,7 +729,7 @@ def agente_4_pedidos_y_tracking_automatico():
                     enviar_telegram(
                         f"🛒 NUEVA VENTA — PEDIDO YA CREADO EN CJ\n\n"
                         f"🧾 Pedido eBay: {order_id}\n"
-                        f"👤 Cliente: {nombre_cliente} ({pais_destino})\n"
+                        f"👤 Cliente: {nombre_cliente} ({pais_destino}) | Salida: {origen_almacen}\n"
                         f"💶 Coste CJ a pagar: {coste_total_cj_pedido}€ (Ganancia limpia: +{beneficio_pedido}€)\n"
                         f"👉 Entra en CJ Dropshipping > Orders y pulsa Pay."
                     )
@@ -731,14 +739,14 @@ def agente_4_pedidos_y_tracking_automatico():
     return pedidos_tramitados, trackings_subidos
 
 # ==============================================================================
-# AGENTE 1 (TENDENCIAS + RADAR COMPETENCIA): Prioriza el mayor margen ganador
+# AGENTE 1 (TENDENCIAS + RADAR COMPETENCIA): Busca en ES, FR y PL sin Alemania
 # ==============================================================================
 def es_producto_seguro_ue(titulo_en):
     palabras = set(re.findall(r"[a-z]+", str(titulo_en).lower()))
     return len(palabras.intersection(PALABRAS_PROHIBIDAS_UE)) == 0
 
 def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_candidatos=6):
-    print("🔍 [Agente 1 - Radar Competitivo] Buscando productos en España (ES) priorizando máximo margen bajo competencia...")
+    print("🔍 [Agente 1 - Radar Competitivo] Buscando productos en ES, FR y PL priorizando máximo margen bajo competencia...")
     headers_cj = {"CJ-Access-Token": CJ_ACCESS_TOKEN}
     lista_keywords = ["organizer", "lamp", "holder", "storage", "decor", "rack", "kitchen", "stand"]
     random.shuffle(lista_keywords)
@@ -779,7 +787,6 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_can
                 except (ValueError, TypeError):
                     listed_num = 0
 
-                # Rango 2,00€ - 11,50€ para captar también artículos de ~10€ total que se venden a 20€-25€
                 if 2.0 <= coste_base <= 11.5:
                     det_data, vid, coste_variante_max = obtener_detalle_variante_cj(pid)
                     if not det_data or not vid:
@@ -847,9 +854,6 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_can
                     })
 
                     if len(candidatos) >= max_candidatos:
-                        # Prioridad 1: competencia real detectada y precio más barato que rivales
-                        # Prioridad 2: mayor beneficio limpio posible
-                        # Prioridad 3: popularidad (listedNum) en CJ
                         candidatos.sort(
                             key=lambda x: (
                                 x["mediana_comp"] is not None and x["ventaja_precio"] > 0,
@@ -861,7 +865,7 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_can
                         return candidatos
 
     if not candidatos:
-        raise Exception("No se encontraron candidatos competitivos con margen blindado hoy en España.")
+        raise Exception("No se encontraron candidatos competitivos con margen blindado hoy en ES, FR o PL.")
     candidatos.sort(
         key=lambda x: (
             x["mediana_comp"] is not None and x["ventaja_precio"] > 0,
@@ -877,6 +881,9 @@ def agente_1_cazar_candidatos_seguros(skus_excluidos, titulos_excluidos, max_can
 # ==============================================================================
 def agente_2_diseno_multimedia(producto):
     print("🎨 [Agente 2 - Diseño] Creando 10 anuncios + Vídeo Vertical MP4 + Lote CSV para Canva Pro...")
+    pais_cod = producto.get("almacen", "ES")
+    nombre_pais = INFO_ALMACENES_UE.get(pais_cod, INFO_ALMACENES_UE["ES"])["nombre"]
+
     disenos = llamar_groq(
         "Eres un director creativo de e-commerce en Europa.",
         f"Producto: {producto['titulo_en']}. Precio: {producto['precio_venta']}€. Genera un JSON con una lista 'variantes' de exactamente 10 versiones de anuncio. Cada ítem debe tener: 'id' (1 a 10), 'gancho' (máx 4 palabras impactantes en español), 'angulo' (frase persuasiva para TikTok/Pinterest) y 'color_hex' (color oscuro elegante ej: #0F172A, #1E3A8A, #065F46, #7C2D12)."
@@ -884,7 +891,7 @@ def agente_2_diseno_multimedia(producto):
 
     os.makedirs("anuncios_generados", exist_ok=True)
     lista_variantes = disenos.get("variantes") or [
-        {"id": i + 1, "gancho": "PRECIO DIRECTO ES", "angulo": "Envío rápido desde España", "color_hex": "#0F172A"}
+        {"id": i + 1, "gancho": "PRECIO DIRECTO UE", "angulo": f"Envío rápido desde {nombre_pais}", "color_hex": "#0F172A"}
         for i in range(10)
     ]
     lista_variantes = lista_variantes[:10]
@@ -909,7 +916,7 @@ def agente_2_diseno_multimedia(producto):
             draw.rectangle([(0, 0), (1080, 130)], fill=color_fondo)
             draw.text((40, 48), f"★ {v.get('gancho', 'TOP VENTAS').upper()} | {producto['precio_venta']}€ ★", fill="#FFFFFF")
             draw.rectangle([(0, 960), (1080, 1080)], fill="#111827")
-            draw.text((40, 1005), "ENVIO DESDE ESPAÑA (3-5 DIAS) - GARANTIA 14 DIAS", fill="#10B981")
+            draw.text((40, 1005), f"ENVIO DESDE {nombre_pais.upper()} (3-7 DIAS) - GARANTIA 14 DIAS", fill="#10B981")
 
             ruta_jpg = f"anuncios_generados/anuncio_v{v.get('id', idx+1)}.jpg"
             lienzo_rgb = lienzo.convert("RGB")
@@ -931,7 +938,7 @@ def agente_2_diseno_multimedia(producto):
     return lista_variantes
 
 # ==============================================================================
-# AGENTE 3 (TIENDA ESPAÑA): SEO clonado de Top Ventas + Publicación eBay ES
+# AGENTE 3 (TIENDA UE SIN ALEMANIA): SEO Top Ventas + Origen real ES / FR / PL
 # ==============================================================================
 def obtener_categorias_hoja_ebay_es(query_es, titulo_es=""):
     print("📂 [Agente 3] Buscando subcategorías hoja válidas en eBay España (Tree 186)...")
@@ -1011,12 +1018,15 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
     if not isinstance(seo_raw, dict):
         seo_raw = {}
 
+    pais_cod = producto.get("almacen", "ES")
+    nombre_pais = INFO_ALMACENES_UE.get(pais_cod, INFO_ALMACENES_UE["ES"])["nombre"]
+
     titulo = (
         seo_raw.get("titulo")
         or seo_raw.get("title")
         or seo_raw.get("Title")
         or seo_raw.get("titulo_seo")
-        or f"{producto['titulo_en'][:55]} Envio Espana"
+        or f"{producto['titulo_en'][:55]} Envio UE"
     ).strip()
 
     for prohibida in ["gratis", "regalo", "oferta", "100%", "garantizado", "envio rapido"]:
@@ -1031,7 +1041,7 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
         or seo_raw.get("description_html")
         or seo_raw.get("descripcion")
         or seo_raw.get("description")
-        or f"<p><b>Calidad y Diseño Moderno - Envío desde España</b></p><p>{texto_limpio[:500]}</p><ul><li>Envío rápido desde almacén en España.</li><li>Devolución aceptada en 14 días según normativa europea.</li></ul>"
+        or f"<p><b>Calidad y Diseño Moderno - Envío desde {nombre_pais}</b></p><p>{texto_limpio[:500]}</p><ul><li>Envío desde almacén europeo en {nombre_pais} (3 a 7 días laborables).</li><li>Devolución aceptada en 14 días según normativa europea.</li></ul>"
     )
     descripcion = re.sub(r"https?://\S+|www\.\S+", "", str(descripcion))
 
@@ -1069,6 +1079,12 @@ def normalizar_seo_listing(seo_raw, producto, texto_limpio):
 
 def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, perfiles_vendedor, incluir_mejor_oferta=True):
     titulo_xml = limpiar_xml(seo["titulo"])
+    pais_cod = producto.get("almacen", "ES")
+    if pais_cod not in INFO_ALMACENES_UE:
+        pais_cod = "ES"
+    info_alm = INFO_ALMACENES_UE[pais_cod]
+
+    bloque_cp = f"<PostalCode>{info_alm['cp']}</PostalCode>" if info_alm.get("cp") else ""
 
     bloque_politicas = ""
     if perfiles_vendedor and perfiles_vendedor.get("opted_in"):
@@ -1102,11 +1118,11 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
         <PrimaryCategory><CategoryID>{cat_id}</CategoryID></PrimaryCategory>
         <StartPrice>{producto['precio_venta']}</StartPrice>
         <ConditionID>1000</ConditionID>
-        <Country>ES</Country>
-        <PostalCode>08001</PostalCode>
-        <Location>Barcelona, España</Location>
+        <Country>{pais_cod}</Country>
+        {bloque_cp}
+        <Location>{info_alm['ubicacion']}</Location>
         <Currency>EUR</Currency>
-        <DispatchTimeMax>2</DispatchTimeMax>
+        <DispatchTimeMax>{info_alm['dispatch']}</DispatchTimeMax>
         <ListingDuration>GTC</ListingDuration>
         <ListingType>FixedPriceItem</ListingType>
         <Quantity>{STOCK_POR_ANUNCIO}</Quantity>
@@ -1126,7 +1142,10 @@ def construir_xml_publicacion(producto, seo, cat_id, specifics_xml, fotos_xml, p
     </AddFixedPriceItemRequest>"""
 
 def agente_3_publicar_tienda_europa(producto, perfiles):
-    print("🛒 [Agente 3 - Tienda ES] Preparando ficha SEO inspirada en Top Ventas eBay España...")
+    pais_cod = producto.get("almacen", "ES")
+    nombre_pais = INFO_ALMACENES_UE.get(pais_cod, INFO_ALMACENES_UE["ES"])["nombre"]
+    print(f"🛒 [Agente 3 - Tienda UE ({nombre_pais})] Preparando ficha SEO inspirada en Top Ventas eBay España...")
+
     texto_limpio = BeautifulSoup(producto["descripcion_en"], "html.parser").get_text(" ", strip=True)[:800]
     rivales_txt = "\n".join([f"- {t}" for t in producto.get("titulos_rivales", [])]) or "Sin referencias previas"
 
@@ -1135,6 +1154,7 @@ def agente_3_publicar_tienda_europa(producto, perfiles):
         f"""Optimiza este producto para eBay España superando a los anuncios mejor posicionados del mercado.
 Producto proveedor: {producto['titulo_en']}
 Detalles: {texto_limpio}
+País de envío: {nombre_pais}
 Títulos reales de competidores top en eBay España (úsalos para extraer las palabras clave exactas que buscan los clientes):
 {rivales_txt}
 
@@ -1142,7 +1162,7 @@ Devuelve este JSON exacto:
 {{
   "query_categoria": "2 palabras en español del objeto",
   "titulo": "Título descriptivo en español de 60 a 76 caracteres con las mejores palabras clave de búsqueda",
-  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara, convincente y objetiva del producto en español.</p><ul><li>Ventaja práctica 1</li><li>Ventaja práctica 2</li><li>Envío rápido desde almacén en España.</li></ul>",
+  "descripcion_html": "<p><b>Calidad y Diseño Funcional</b></p><p>Descripción clara, convincente y objetiva del producto en español.</p><ul><li>Ventaja práctica 1</li><li>Ventaja práctica 2</li><li>Envío desde almacén europeo en {nombre_pais} (3 a 7 días laborables).</li></ul>",
   "specifics": {{
     "Marca": "Sin marca",
     "Tipo": "Accesorio de hogar",
@@ -1174,7 +1194,7 @@ Devuelve este JSON exacto:
 
     for cid, cname in candidatos_cat[:3]:
         ultima_cat = cid
-        print(f"🚀 [Agente 3] Intentando publicar en subcategoría {cid} ({cname})...")
+        print(f"🚀 [Agente 3] Intentando publicar en subcategoría {cid} ({cname}) desde {nombre_pais}...")
         xml = construir_xml_publicacion(producto, seo, cid, specifics_xml, fotos_xml, perfiles, incluir_mejor_oferta=True)
         res = ebay_xml_call("AddFixedPriceItem", xml)
 
@@ -1201,6 +1221,8 @@ Devuelve este JSON exacto:
 # ==============================================================================
 def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
     ebay_link = f"https://www.ebay.es/itm/{item_id}"
+    pais_cod = producto.get("almacen", "ES")
+    nombre_pais = INFO_ALMACENES_UE.get(pais_cod, INFO_ALMACENES_UE["ES"])["nombre"]
     canales_activos = ["eBay ES + Unión Europea", "Mejor Oferta Auto", "Vídeo Reel MP4", "Lote Canva CSV"]
 
     if PINTEREST_TOKEN and PINTEREST_BOARD_ID and item_id != "ERROR_EBAY":
@@ -1214,7 +1236,7 @@ def agente_7_promocion_gratis_multicanal(producto, seo, variantes, item_id):
             payload_pin = {
                 "board_id": PINTEREST_BOARD_ID,
                 "title": seo["titulo"][:100],
-                "description": f"{gancho} ✨ Envío rápido desde España.",
+                "description": f"{gancho} ✨ Envío desde {nombre_pais} (3-7 días).",
                 "link": ebay_link,
                 "media_source": {
                     "source_type": "image_url",
@@ -1253,7 +1275,7 @@ def agente_5_atencion_clientes():
                 pregunta = msg.find(".//eb:Body", ns).text
 
                 borrador = llamar_groq(
-                    "Eres soporte oficial de nuestra tienda en eBay España. Sé amable y directo. Enviamos desde España con seguimiento y 14 días de garantía.",
+                    "Eres soporte oficial de nuestra tienda en eBay España. Sé amable y directo. Enviamos desde nuestros almacenes de la Unión Europea (España, Francia o Polonia) con seguimiento en 3-7 días laborables y 14 días de garantía.",
                     f"El comprador '{sender}' pregunta: '{pregunta}'. Redacta la respuesta lista para enviar:",
                     json_mode=False
                 )
@@ -1278,7 +1300,7 @@ def agente_5_atencion_clientes():
 # EJECUCIÓN MAESTRA DE LOS 7 AGENTES
 # ==============================================================================
 if __name__ == "__main__":
-    print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR COMPETITIVO (29 DÍAS) ===")
+    print("=== ARRANCANDO ZONA 2 PRO: MODO FRANCOTIRADOR COMPETITIVO (ES/FR/PL - SIN DE) ===")
 
     # 1. Vigilancia diaria obligatoria (0,00€): poda día 29 + escudo stock/precio CJ + pedidos + trackings + mensajes
     skus_activos, titulos_activos, podados, ganadores, min_dias_activo = agente_6_datos_podar_catalogo()
@@ -1312,12 +1334,13 @@ if __name__ == "__main__":
                     variantes = agente_2_diseno_multimedia(cand)
                     canales = agente_7_promocion_gratis_multicanal(cand, seo, variantes, item_id)
 
+                    nombre_alm = INFO_ALMACENES_UE.get(cand["almacen"], INFO_ALMACENES_UE["ES"])["nombre"]
                     texto_ganadores = ", ".join(ganadores[:3]) if ganadores else "Construyendo primeras ventas"
                     txt_comp = f"{cand['mediana_comp']}€ (ahorro -{cand['ventaja_precio']}€ vs rivales)" if cand.get("mediana_comp") else "Sin rivales directos"
                     informe = (
                         f"🟢 ZONA 2 PRO — PRODUCTO TOP MARGEN PUBLICADO\n\n"
                         f"📦 Producto: {seo['titulo']} ({STOCK_POR_ANUNCIO} uds.)\n"
-                        f"🏭 Almacén: {cand['almacen']} (España)\n"
+                        f"🏭 Almacén real: {cand['almacen']} ({nombre_alm})\n"
                         f"💶 PVP: {cand['precio_venta']}€ (Mediana rivales: {txt_comp} | Auto-oferta desde {cand['oferta_autoaceptar']}€)\n"
                         f"📊 Costes cubiertos: Prod {cand['coste_cj']}€ + Envío {cand['envio_real_ue']}€ + Com. eBay {cand['comision_ebay']}€ + Ads 2.5% {cand['coste_promo']}€ + Ins. {TARIFA_INSERCION_EBAY}€\n"
                         f"💰 Limpio 1ª venta: +{cand['beneficio_neto']}€ | 2ª y 3ª venta: +{cand['beneficio_siguientes']}€\n"
